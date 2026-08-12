@@ -1,0 +1,12 @@
+{
+  "name": "xtui-local",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local command wrapper for the XTUI terminal client",
+  "bin": {
+    "xtui": "bin/xtui.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

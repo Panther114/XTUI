@@ -1,0 +1,7 @@
+/target/
+/target-browser*/
+/target-ui/
+/target-gui/
+/xtui.exe
+*.log
+.env
