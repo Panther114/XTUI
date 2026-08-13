@@ -45,7 +45,7 @@ jobs:
       - name: Package Chrome and Edge extension
         run: |
           cd extension
-          zip -r ../xtui-extension-chrome.zip manifest.json background.js content.js popup.html popup.css popup.js PRIVACY.md STORE_LISTING.md
+          zip -r ../xtui-extension-chrome.zip manifest.json background.js content.js interceptor.js timeline.js popup.html popup.css popup.js PRIVACY.md STORE_LISTING.md
           cp ../xtui-extension-chrome.zip ../xtui-extension-edge.zip
       - uses: actions/upload-artifact@v4
         with:

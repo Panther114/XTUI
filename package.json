@@ -1,11 +1,29 @@
 {
-  "name": "xtui-local",
-  "version": "0.2.6",
+  "name": "xtui",
+  "version": "0.3.7",
   "private": true,
-  "description": "Local command wrapper for the XTUI terminal client",
+  "description": "X in your terminal. Keyboard-first TUI client that uses your existing Chrome or Edge session.",
   "bin": {
     "xtui": "bin/xtui.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Panther114/XTUI.git"
+  },
+  "homepage": "https://github.com/Panther114/XTUI",
+  "bugs": {
+    "url": "https://github.com/Panther114/XTUI/issues"
+  },
+  "license": "MIT",
+  "keywords": [
+    "x",
+    "twitter",
+    "tui",
+    "terminal",
+    "cli",
+    "ratatui",
+    "keyboard"
+  ],
   "engines": {
     "node": ">=18"
   }

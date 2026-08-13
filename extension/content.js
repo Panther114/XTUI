@@ -10,6 +10,179 @@ const metricNumber = (text) => {
 let cachedLocation = location.href;
 const postCache = new Map();
 const MAX_POST_CACHE = 800;
+const XTUI_CHANNEL = "xtui.timeline.v3";
+let currentRouteKey = null;
+let currentOperation = null;
+let replaySequence = 0;
+const replayWaiters = new Map();
+const queuedCaptures = [];
+
+function findCursor(root, wanted) {
+  let found = null;
+  const visit = (value) => {
+    if (found || !value || typeof value !== "object") return;
+    if (value.cursorType === wanted && typeof value.value === "string") {
+      found = value.value;
+      return;
+    }
+    for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child);
+  };
+  visit(root);
+  return found;
+}
+
+function unwrapResult(value) {
+  let result = value;
+  for (let depth = 0; depth < 6 && result && typeof result === "object"; depth += 1) {
+    if (result.result && typeof result.result === "object") result = result.result;
+    else if (result.tweet && typeof result.tweet === "object") result = result.tweet;
+    else break;
+  }
+  return result;
+}
+
+function jsonMedia(legacy) {
+  return (legacy?.extended_entities?.media || []).map((item) => {
+    const video = item.type === "video" || item.type === "animated_gif";
+    const variants = item.video_info?.variants || [];
+    const best = variants
+      .filter((variant) => variant.content_type === "video/mp4" && variant.url)
+      .sort((left, right) => Number(right.bitrate || 0) - Number(left.bitrate || 0))[0];
+    return {
+      kind: video ? "video" : "photo",
+      url: video ? best?.url || item.media_url_https : item.media_url_https,
+      alt: item.ext_alt_text || null,
+    };
+  }).filter((item) => item.url);
+}
+
+function jsonPost(value, quotedIds) {
+  const tweet = unwrapResult(value);
+  const legacy = tweet?.legacy;
+  const id = String(tweet?.rest_id || legacy?.id_str || "");
+  if (!id || !legacy || (!legacy.full_text && !legacy.text)) return null;
+  const user = unwrapResult(tweet.core?.user_results || tweet.author_results || legacy.user_results);
+  const userLegacy = user?.legacy || {};
+  const username = userLegacy.screen_name || user?.core?.screen_name || "";
+  if (!username) return null;
+  const quotedValue = tweet.quoted_status_result || legacy.quoted_status_result;
+  const quoted = quotedValue ? jsonPost(quotedValue, quotedIds) : null;
+  if (quoted) quotedIds.add(quoted.id);
+  const noteText = tweet.note_tweet?.note_tweet_results?.result?.text;
+  let createdAt = null;
+  if (legacy.created_at) {
+    const parsed = new Date(legacy.created_at);
+    if (!Number.isNaN(parsed.valueOf())) createdAt = parsed.toISOString();
+  }
+  return {
+    id,
+    text: noteText || legacy.full_text || legacy.text || "",
+    name: userLegacy.name || user?.core?.name || username,
+    username,
+    verified: Boolean(user?.is_blue_verified || userLegacy.verified),
+    created_at: createdAt,
+    replies: Number(legacy.reply_count || 0),
+    reposts: Number(legacy.retweet_count || 0),
+    likes: Number(legacy.favorite_count || 0),
+    views: Number(tweet.views?.count || 0),
+    media: jsonMedia(legacy),
+    quoted,
+  };
+}
+
+function normalizeTimeline(payload) {
+  const posts = new Map();
+  const quotedIds = new Set();
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    const post = jsonPost(value, quotedIds);
+    if (post && !posts.has(post.id)) posts.set(post.id, post);
+    for (const child of Array.isArray(value) ? value : Object.values(value)) visit(child);
+  };
+  visit(payload);
+  for (const id of quotedIds) posts.delete(id);
+  return {
+    posts: [...posts.values()],
+    top_cursor: findCursor(payload, "Top"),
+    bottom_cursor: findCursor(payload, "Bottom"),
+  };
+}
+
+function operationMatchesRoute(operation, route) {
+  const name = String(operation || "").toLowerCase();
+  const expected = String(route || "").toLowerCase();
+  if (!name || !expected) return false;
+  if (expected === "home") return name.includes("home") && name.includes("timeline");
+  if (expected === "search") return name.includes("searchtimeline");
+  if (expected === "bookmarks") return name.includes("bookmark");
+  if (expected === "mentions") return name.includes("notification") || name.includes("mention");
+  if (expected === "user" || expected === "user_posts") return name.includes("usertweets");
+  if (expected === "likes") return name.includes("likes");
+  if (expected === "list_posts") return name.includes("list") && name.includes("timeline");
+  if (expected === "thread") return name.includes("tweetdetail");
+  return false;
+}
+
+function deliverCapture(batch) {
+  if (!currentRouteKey || !currentOperation) {
+    queuedCaptures.push(batch);
+    if (queuedCaptures.length > 8) queuedCaptures.shift();
+    return;
+  }
+  // Operation names are private implementation details and change often.
+  // Prefer the known route name, but accept a cursor-bearing timeline batch
+  // from the configured route so cosmetic X renames do not disable replay.
+  if (!operationMatchesRoute(batch.operation, currentOperation) && !batch.bottom_cursor) return;
+  window.postMessage(
+    { channel: XTUI_CHANNEL, kind: "accept", captureId: batch.capture_id },
+    location.origin,
+  );
+  void chrome.runtime.sendMessage({
+    type: "xtui-timeline-capture",
+    route_key: currentRouteKey,
+    batch,
+  }).catch(() => {});
+}
+
+window.addEventListener("message", (event) => {
+  if (event.source !== window || event.origin !== location.origin) return;
+  const message = event.data;
+  if (message?.channel !== XTUI_CHANNEL) return;
+  if (message.kind === "capture") {
+    const normalized = normalizeTimeline(message.payload);
+    if (!normalized.posts.length) return;
+    deliverCapture({
+      ...normalized,
+      operation: message.operation,
+      capture_id: message.captureId,
+      direction: message.requestCursor ? "tail" : "head",
+      replay_id: message.replayId || null,
+    });
+  } else if (message.kind === "replay-result") {
+    const waiter = replayWaiters.get(message.replayId);
+    if (!waiter) return;
+    replayWaiters.delete(message.replayId);
+    waiter(message.ok ? { ok: true, value: true } : { ok: false, error: message.error });
+  }
+});
+
+function replayTimeline(cursor) {
+  const replayId = `replay-${Date.now()}-${++replaySequence}`;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      replayWaiters.delete(replayId);
+      resolve({ ok: false, error: "timeline replay timed out" });
+    }, 10000);
+    replayWaiters.set(replayId, (result) => {
+      clearTimeout(timer);
+      resolve(result);
+    });
+    window.postMessage(
+      { channel: XTUI_CHANNEL, kind: "replay", replayId, cursor: cursor || null },
+      location.origin,
+    );
+  });
+}
 
 function extractPost(article) {
   const time = article.querySelector("time");
@@ -106,8 +279,13 @@ const observer = new MutationObserver((mutations) => {
     }
   }
 });
-observer.observe(document.documentElement, { childList: true, subtree: true });
-scanPosts();
+function startDomFallback() {
+  if (!document.documentElement) return;
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  scanPosts();
+}
+if (document.documentElement) startDomFallback();
+else document.addEventListener("DOMContentLoaded", startDomFallback, { once: true });
 
 function collectSelf() {
   const profile =
@@ -179,6 +357,17 @@ function quiescePage() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, respond) => {
+  if (message.type === "configure") {
+    currentRouteKey = message.route_key || null;
+    currentOperation = message.operation || null;
+    while (currentRouteKey && queuedCaptures.length) deliverCapture(queuedCaptures.shift());
+    respond({ ok: true, value: true });
+    return false;
+  }
+  if (message.type === "replay") {
+    void replayTimeline(message.cursor || null).then(respond);
+    return true;
+  }
   try {
     quiescePage();
     if (message.type === "posts") respond({ ok: true, value: collectPosts() });
@@ -204,4 +393,5 @@ chrome.runtime.onMessage.addListener((message, _sender, respond) => {
   } catch (error) {
     respond({ ok: false, error: String(error?.message || error) });
   }
+  return false;
 });

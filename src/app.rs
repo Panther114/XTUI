@@ -1,7 +1,7 @@
 use crate::{api::Api, config::Config, keys::KeyBindings, media, model::*};
 use anyhow::{Result, bail};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -100,9 +100,10 @@ pub enum UiMsg {
         result: Result<Page<Post>>,
     },
     MediaDone {
-        generation: u32,
         url: String,
-        result: Result<Vec<String>>,
+        open: bool,
+        counted: bool,
+        result: Result<media::PreviewImage>,
     },
     SignInOpened {
         result: Result<()>,
@@ -127,6 +128,17 @@ pub struct ViewState {
     body_scroll: usize,
 }
 
+#[derive(Clone)]
+struct HomeCache {
+    feed: FeedKind,
+    posts: Vec<Post>,
+    selected: usize,
+    status: String,
+    error: Option<String>,
+    next_token: Option<String>,
+    body_scroll: usize,
+}
+
 pub struct App {
     pub api: Arc<dyn Api>,
     pub screen: Screen,
@@ -145,7 +157,7 @@ pub struct App {
     pub browser_mode: bool,
     pub should_quit: bool,
     pub thread_expanded: bool,
-    pub media_preview: Option<(String, Vec<String>)>,
+    pub media_preview: Option<(String, media::PreviewImage)>,
     pub next_token: Option<String>,
     pub body_scroll: usize,
     pub body_scroll_max: usize,
@@ -166,11 +178,14 @@ pub struct App {
     pending_ops: usize,
     pending_since: Option<Instant>,
     generation: u32,
-    media_generation: u32,
-    media_cache: VecDeque<(String, Vec<String>)>,
+    media_cache: VecDeque<(String, media::PreviewImage)>,
+    media_inflight: HashSet<String>,
+    open_media_on_arrival: HashSet<String>,
+    pub image_engine: Option<media::ImageEngine>,
     external_opener: Arc<ExternalOpener>,
     next_background_fetch: Instant,
     thread_sync_attempts: usize,
+    home_cache: Option<HomeCache>,
 }
 
 impl App {
@@ -213,11 +228,14 @@ impl App {
             pending_ops: 0,
             pending_since: None,
             generation: 0,
-            media_generation: 0,
             media_cache: VecDeque::new(),
+            media_inflight: HashSet::new(),
+            open_media_on_arrival: HashSet::new(),
+            image_engine: None,
             external_opener: Arc::new(|target| open::that(target).map_err(anyhow::Error::from)),
             next_background_fetch: Instant::now(),
             thread_sync_attempts: 0,
+            home_cache: None,
         }
     }
 
@@ -463,8 +481,26 @@ impl App {
     }
 
     pub fn root(&mut self, screen: Screen) {
+        self.remember_home();
         self.history.clear();
         self.screen = screen;
+        if matches!(self.screen, Screen::Home)
+            && let Some(cached) = self
+                .home_cache
+                .as_ref()
+                .filter(|cached| cached.feed == self.feed_kind)
+                .cloned()
+        {
+            self.posts = cached.posts;
+            self.selected = cached.selected.min(self.posts.len().saturating_sub(1));
+            self.status = cached.status;
+            self.error = cached.error;
+            self.next_token = cached.next_token;
+            self.body_scroll = cached.body_scroll;
+            self.lists.clear();
+            self.request_screen(Screen::Home, true);
+            return;
+        }
         self.posts.clear();
         self.lists.clear();
         self.selected = 0;
@@ -492,12 +528,17 @@ impl App {
             self.body_scroll = view.body_scroll;
             self.body_scroll_max = 0;
             self.next_background_fetch = Instant::now();
+            if self.browser_mode && matches!(self.screen, Screen::Home) {
+                let api = self.api.clone();
+                tokio::spawn(async move { api.release_secondary().await });
+            }
         } else {
             self.status = "Already at the top level · press Q to quit".into();
         }
     }
 
     fn push_view(&mut self, screen: Screen) {
+        self.remember_home();
         let previous = ViewState {
             screen: std::mem::replace(&mut self.screen, screen),
             posts: std::mem::take(&mut self.posts),
@@ -516,6 +557,21 @@ impl App {
             self.history.remove(0);
         }
         self.history.push(previous);
+    }
+
+    fn remember_home(&mut self) {
+        if !matches!(self.screen, Screen::Home) || self.posts.is_empty() {
+            return;
+        }
+        self.home_cache = Some(HomeCache {
+            feed: self.feed_kind,
+            posts: self.posts.clone(),
+            selected: self.selected,
+            status: self.status.clone(),
+            error: self.error.clone(),
+            next_token: self.next_token.clone(),
+            body_scroll: self.body_scroll,
+        });
     }
 
     pub fn activate(&mut self) {
@@ -624,7 +680,7 @@ impl App {
         let mut items = vec![];
         if self.demo {
             items.push((
-                "Start reading (demo — no account)".into(),
+                "Start (demo — no account)".into(),
                 LandingAction::Start,
             ));
         } else {
@@ -633,7 +689,7 @@ impl App {
             } else {
                 "live · X API"
             };
-            items.push((format!("Start reading ({mode})"), LandingAction::Start));
+            items.push((format!("Start ({mode})"), LandingAction::Start));
         }
         if !self.browser_mode {
             items.push(("Connect browser extension".into(), LandingAction::SignIn));
@@ -738,7 +794,9 @@ impl App {
         if !silent {
             self.status = "Loading…".into();
         }
-        self.next_token = None;
+        if !silent {
+            self.next_token = None;
+        }
         self.generation += 1;
         self.begin_pending();
         let api = self.api.clone();
@@ -834,32 +892,74 @@ impl App {
         true
     }
 
+    pub fn cached_media(&self, url: &str) -> Option<&media::PreviewImage> {
+        self.media_cache
+            .iter()
+            .find(|(key, _)| key == url)
+            .map(|(_, image)| image)
+    }
+
+    pub fn selected_preview_url(&self) -> Option<String> {
+        self.selected_post()
+            .and_then(|post| post.media.first())
+            .and_then(media::best_preview_url)
+    }
+
+    pub fn attach_image_engine(&mut self) {
+        self.image_engine = Some(media::ImageEngine::detect());
+    }
+
+    pub fn activity_ms(&self) -> u128 {
+        self.pending_since
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or(0)
+    }
+
+    /// Decode stills for every visible post so unselected cards also show
+    /// native images once the bytes arrive.
+    pub fn ensure_visible_media<I>(&mut self, urls: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for url in urls {
+            self.start_media_fetch(url, false);
+        }
+    }
+
     pub fn request_media_preview(&mut self) {
         let Some(item) = self.selected_post().and_then(|p| p.media.first()).cloned() else {
             self.status = "This post has no attached media.".into();
             return;
         };
-        let url = item.preview_url.as_ref().or(item.url.as_ref()).cloned();
-        let Some(url) = url else {
-            self.status = "No preview is available for this media.".into();
+        let Some(url) = media::best_preview_url(&item) else {
+            self.status = "No still preview is available — press V to open the media.".into();
             return;
         };
         let alt = item.alt_text.unwrap_or_else(|| format!("{:?}", item.kind));
-        if let Some((_, lines)) = self.media_cache.iter().find(|(key, _)| key == &url) {
-            self.media_preview = Some((alt, lines.clone()));
+        if let Some(image) = self.cached_media(&url).cloned() {
+            self.media_preview = Some((alt, image));
             self.status = "Media preview · cached".into();
             return;
         }
         self.status = "Rendering media preview…".into();
-        self.media_generation += 1;
-        self.begin_pending();
-        let generation = self.media_generation;
+        self.open_media_on_arrival.insert(url.clone());
+        self.start_media_fetch(url, true);
+    }
+
+    fn start_media_fetch(&mut self, url: String, counted: bool) {
+        if self.cached_media(&url).is_some() || !self.media_inflight.insert(url.clone()) {
+            return;
+        }
+        if counted {
+            self.begin_pending();
+        }
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = media::download_preview(&url, 68, 24).await;
+            let result = media::download_preview(&url).await;
             let _ = tx.send(UiMsg::MediaDone {
-                generation,
                 url,
+                open: counted,
+                counted,
                 result,
             });
         });
@@ -871,7 +971,10 @@ impl App {
         let mut changed = false;
         while let Ok(message) = self.rx.try_recv() {
             changed = true;
-            self.end_pending();
+            let counted = !matches!(&message, UiMsg::MediaDone { counted: false, .. });
+            if counted {
+                self.end_pending();
+            }
             match message {
                 UiMsg::Bootstrap { me } => match me {
                     Ok(me) => {
@@ -920,26 +1023,38 @@ impl App {
                     self.apply_more(result, silent);
                 }
                 UiMsg::MediaDone {
-                    generation,
                     url,
+                    open,
+                    counted: _,
                     result,
                 } => {
-                    if generation != self.media_generation {
-                        continue;
-                    }
+                    self.media_inflight.remove(&url);
+                    let should_open = open || self.open_media_on_arrival.remove(&url);
                     match result {
-                        Ok(lines) => {
-                            self.media_cache.push_front((url, lines.clone()));
-                            self.media_cache.truncate(8);
-                            let alt = self
-                                .selected_post()
-                                .and_then(|p| p.media.first())
-                                .and_then(|m| m.alt_text.clone())
-                                .unwrap_or_else(|| "Media".into());
-                            self.media_preview = Some((alt, lines));
-                            self.status = "Media preview · rendered".into();
+                        Ok(image) => {
+                            if self.media_cache.len() >= 32 {
+                                if let Some((evicted, _)) = self.media_cache.pop_back() {
+                                    if let Some(engine) = self.image_engine.as_mut() {
+                                        engine.drop_url(&evicted);
+                                    }
+                                }
+                            }
+                            self.media_cache.push_front((url.clone(), image.clone()));
+                            if should_open {
+                                let alt = self
+                                    .selected_post()
+                                    .and_then(|p| p.media.first())
+                                    .and_then(|m| m.alt_text.clone())
+                                    .unwrap_or_else(|| "Media".into());
+                                self.media_preview = Some((alt, image));
+                                self.status = "Media preview · rendered".into();
+                            }
                         }
-                        Err(e) => self.set_error(e),
+                        Err(e) => {
+                            if should_open {
+                                self.set_error(e);
+                            }
+                        }
                     }
                 }
                 UiMsg::SignInOpened { result } => match result {
@@ -1050,8 +1165,21 @@ impl App {
         } else {
             None
         };
-        self.posts = page.items;
-        self.next_token = page.next_token;
+        if silent {
+            let mut merged = page.items;
+            let incoming: std::collections::HashSet<_> =
+                merged.iter().map(|post| post.id.clone()).collect();
+            merged.extend(
+                std::mem::take(&mut self.posts)
+                    .into_iter()
+                    .filter(|post| !incoming.contains(&post.id)),
+            );
+            self.posts = merged;
+            self.trim_feed();
+        } else {
+            self.posts = page.items;
+            self.next_token = page.next_token;
+        }
         self.selected = self.selected.min(self.posts.len().saturating_sub(1));
         if let Some(anchor) = anchor {
             if let Some(position) = self.posts.iter().position(|post| post.id == anchor) {
@@ -1123,6 +1251,10 @@ impl App {
         self.pending_ops > 0
     }
 
+    pub fn has_media_inflight(&self) -> bool {
+        !self.media_inflight.is_empty()
+    }
+
     /// The current spinner glyph, or None when idle.
     pub fn spinner_frame(&self) -> Option<char> {
         if self.pending_ops == 0 {
@@ -1139,7 +1271,7 @@ impl App {
     /// Test helper: block until every background fetch has been applied.
     pub async fn drain(&mut self) {
         loop {
-            if !self.has_pending() && self.rx.is_empty() {
+            if !self.has_pending() && !self.has_media_inflight() && self.rx.is_empty() {
                 return;
             }
             self.process_messages();
@@ -1487,6 +1619,49 @@ mod tests {
             "silent refresh keeps the reading position"
         );
         assert_eq!(app.status, "Timeline refreshed");
+    }
+
+    #[tokio::test]
+    async fn returning_to_home_never_replaces_the_retained_feed_with_a_small_page() {
+        let mut app = App::new(Arc::new(DemoApi::new()), true);
+        app.bootstrap_for_test().await;
+        let mut retained_tail = app.posts.clone();
+        for (index, post) in retained_tail.iter_mut().enumerate() {
+            post.id = format!("cached-{index}");
+        }
+        app.posts.extend(retained_tail);
+        app.selected = 4;
+        let retained = app.posts.len();
+
+        app.root(Screen::Explore);
+        app.drain().await;
+        app.root(Screen::Home);
+
+        assert_eq!(app.posts.len(), retained);
+        assert_eq!(app.selected, 4);
+        app.drain().await;
+        assert!(app.posts.len() >= retained);
+    }
+
+    #[tokio::test]
+    async fn silent_refresh_prepends_fresh_posts_without_resetting_tail_pagination() {
+        let mut app = App::new(Arc::new(DemoApi::new()), true);
+        app.bootstrap_for_test().await;
+        app.selected = 2;
+        app.next_token = Some("tail-position".into());
+        let anchor = app.selected_post().unwrap().id.clone();
+        let mut fresh = app.posts[0].clone();
+        fresh.id = "fresh-head-post".into();
+        app.apply_page(
+            Page {
+                items: vec![fresh],
+                next_token: Some("head-sample".into()),
+            },
+            true,
+        );
+        assert_eq!(app.posts[0].id, "fresh-head-post");
+        assert_eq!(app.selected_post().map(|post| &post.id), Some(&anchor));
+        assert_eq!(app.next_token.as_deref(), Some("tail-position"));
     }
 
     #[tokio::test]

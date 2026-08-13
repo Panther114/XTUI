@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "XTUI Browser Bridge",
-  "version": "0.2.6",
+  "version": "0.3.7",
   "description": "Uses your existing X session to power the XTUI terminal client.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwM8Z1eMSlnGcYcQTNLtLAxpl0xuvI2ZzGXZAPpsmc7iYQELpjM9FjMUOAYC4ivrQhzMJedsvTHbQA2AjhWaWNqzFrmR+L9U46AR6lOft/J1UF9+yr2QbsPCpIqEsIed+1yErKI8tgn/bw4mwxjBdFXccmmsxoW6wjCrdqLU4QAXexIqI2ToF7nfDzVOtlK02Kobjkr++aM34t6rRB1c8lorwhqSKC/Qngt5fs0D14VTc6E3Yud3hbWZcTabvH1sh+W2q/8cB/wWooorZW57LoW3K69By+hcW165AdoJlNO18T4MWc/rHQd1wc/+i8k7GAK5roq+b70+UfCgC852rIwIDAQAB",
-  "permissions": ["alarms", "nativeMessaging", "tabs"],
+  "permissions": ["alarms", "cookies", "nativeMessaging", "storage", "tabs"],
   "host_permissions": ["https://x.com/*"],
   "background": {
     "service_worker": "background.js"
@@ -12,8 +12,14 @@
   "content_scripts": [
     {
       "matches": ["https://x.com/*"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
+      "js": ["interceptor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://x.com/*"],
+      "js": ["timeline.js", "content.js"],
+      "run_at": "document_start"
     }
   ],
   "action": {

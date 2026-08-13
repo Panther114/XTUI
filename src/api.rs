@@ -14,6 +14,9 @@ pub trait Api: Send + Sync {
     /// Select which Home timeline to serve. Only the browser extension can
     /// honor this; the official API and demo fall back to Following.
     async fn set_feed(&self, _feed: FeedKind) {}
+    /// Release non-home browser transports while preserving their session
+    /// caches. Browser-backed implementations may override this.
+    async fn release_secondary(&self) {}
     async fn search(&self, query: &str, next: Option<&str>) -> Result<Page<Post>>;
     async fn thread(&self, conversation_id: &str) -> Result<Vec<Post>>;
     async fn bookmarks(&self, next: Option<&str>) -> Result<Page<Post>>;

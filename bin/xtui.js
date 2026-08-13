@@ -14,6 +14,8 @@ const root = path.resolve(__dirname, "..");
 const version = require(path.join(root, "package.json")).version;
 const exeName = process.platform === "win32" ? "xtui.exe" : "xtui";
 const localBinary = path.join(root, exeName);
+const versionedBinary = path.join(root, "target", "versions", version, "release", exeName);
+const builtBinary = path.join(root, "target", "release", exeName);
 const cacheRoot = path.join(
   process.env.LOCALAPPDATA || path.join(os.homedir(), ".cache"),
   "xtui",
@@ -22,7 +24,7 @@ const cacheRoot = path.join(
 );
 const cachedBinary = path.join(cacheRoot, exeName);
 const override = process.env.XTUI_BIN;
-const candidates = [override, localBinary, cachedBinary].filter(Boolean);
+const candidates = [override, versionedBinary, builtBinary, localBinary, cachedBinary].filter(Boolean);
 const executable = candidates.find((candidate) => fs.existsSync(candidate));
 
 const RELEASE_BASE =

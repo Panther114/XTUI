@@ -17,8 +17,7 @@ test("extension version matches the CLI package", () => {
 test("extension permissions stay narrowly scoped", () => {
   assert.equal(manifest.manifest_version, 3);
   assert.deepEqual(manifest.host_permissions, ["https://x.com/*"]);
-  assert.deepEqual(manifest.permissions.sort(), ["alarms", "nativeMessaging", "tabs"]);
-  assert.ok(!JSON.stringify(manifest).includes("cookies"));
+  assert.deepEqual(manifest.permissions.sort(), ["alarms", "cookies", "nativeMessaging", "storage", "tabs"]);
   assert.ok(!JSON.stringify(manifest).includes("webRequest"));
 });
 
@@ -46,4 +45,26 @@ test("content extraction accumulates virtualized posts and expands replies", () 
   assert.match(content, /tweet-text-show-more-link/);
   assert.match(content, /expand_text/);
   assert.match(content, /aggressive \? 2\.8 : 1\.45/);
+});
+
+test("timeline JSON is captured at document start and replayed before DOM fallback", () => {
+  const scripts = manifest.content_scripts;
+  assert.equal(scripts[0].js[0], "interceptor.js");
+  assert.equal(scripts[0].run_at, "document_start");
+  assert.equal(scripts[0].world, "MAIN");
+  assert.equal(scripts[1].run_at, "document_start");
+
+  const interceptor = fs.readFileSync(path.join(root, "interceptor.js"), "utf8");
+  const content = fs.readFileSync(path.join(root, "content.js"), "utf8");
+  const background = fs.readFileSync(path.join(root, "background.js"), "utf8");
+  assert.match(interceptor, /acceptedTemplate/);
+  assert.match(interceptor, /withCursor/);
+  assert.match(content, /normalizeTimeline/);
+  assert.match(content, /xtui-timeline-capture/);
+  assert.match(background, /cache\.bottomCursor/);
+  assert.match(background, /type: "replay"/);
+  assert.match(background, /type: "scroll"/);
+  assert.match(background, /collectDirectHome/);
+  assert.match(background, /HomeLatestTimeline/);
+  assert.match(background, /chrome\.cookies\.get/);
 });

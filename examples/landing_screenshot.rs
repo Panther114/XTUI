@@ -1,14 +1,16 @@
 use anyhow::{Context, Result, bail};
 use std::{path::PathBuf, sync::Arc};
 use xtui::{
-    app::App,
+    app::{App, Screen},
     demo::DemoApi,
     ui::screenshot::{CaptureOptions, capture_svg},
 };
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let mut options = CaptureOptions::landing();
     let mut selected = 0usize;
+    let mut screen = "landing".to_owned();
     let mut output = PathBuf::from("artifacts/landing.svg");
     let mut args = std::env::args().skip(1);
 
@@ -17,10 +19,13 @@ fn main() -> Result<()> {
             "--width" => options.columns = parse_u16(args.next(), "--width")?,
             "--height" => options.rows = parse_u16(args.next(), "--height")?,
             "--selected" => selected = parse_usize(args.next(), "--selected")?,
+            "--screen" => screen = args.next().context("--screen requires a name")?,
             "--output" => output = PathBuf::from(args.next().context("--output requires a path")?),
             "--help" | "-h" => {
                 println!(
-                    "cargo run --example landing_screenshot -- [--width 110] [--height 44] \\\n+                     [--selected 0] [--output artifacts/landing.svg]"
+                    "cargo run --example landing_screenshot -- [--width 110] [--height 44] \
+                     [--screen landing|home|lists] [--selected 0] \
+                     [--output artifacts/landing.svg]"
                 );
                 return Ok(());
             }
@@ -29,7 +34,20 @@ fn main() -> Result<()> {
     }
 
     let mut app = App::new(Arc::new(DemoApi::new()), true);
-    app.landing_selected = selected;
+    match screen.as_str() {
+        "landing" => app.landing_selected = selected,
+        "home" => {
+            app.root(Screen::Home);
+            app.drain().await;
+            app.selected = selected.min(app.posts.len().saturating_sub(1));
+        }
+        "lists" => {
+            app.root(Screen::Lists);
+            app.drain().await;
+            app.selected = selected.min(app.lists.len().saturating_sub(1));
+        }
+        other => bail!("unknown screen: {other}"),
+    }
     let svg = capture_svg(&mut app, options)?;
     if let Some(parent) = output
         .parent()

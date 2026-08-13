@@ -24,6 +24,13 @@ use tokio::{
 };
 
 pub const EXTENSION_ID: &str = "iepklfmnjidigljfaegfjlbeghpjejka";
+/// Older unpacked builds that still speak the current bridge protocol.
+/// Reload is optional while one of these is running.
+const COMPATIBLE_EXTENSION_VERSIONS: &[&str] = &["0.3.2", "0.3.3", "0.3.4", "0.3.5", "0.3.6"];
+
+fn extension_version_supported(running: &str) -> bool {
+    running == env!("CARGO_PKG_VERSION") || COMPATIBLE_EXTENSION_VERSIONS.contains(&running)
+}
 const HOST_NAME: &str = "com.xtui.bridge";
 const BRIDGE_ADDRESS: &str = "127.0.0.1:17471";
 const MAX_MESSAGE_BYTES: usize = 512 * 1024;
@@ -32,6 +39,11 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(35);
 const EXTENSION_FILES: &[(&str, &str)] = &[
     ("manifest.json", include_str!("../extension/manifest.json")),
     ("background.js", include_str!("../extension/background.js")),
+    ("timeline.js", include_str!("../extension/timeline.js")),
+    (
+        "interceptor.js",
+        include_str!("../extension/interceptor.js"),
+    ),
     ("content.js", include_str!("../extension/content.js")),
     ("popup.html", include_str!("../extension/popup.html")),
     ("popup.css", include_str!("../extension/popup.css")),
@@ -208,14 +220,25 @@ pub fn run_native_host() -> Result<()> {
         for incoming in listener.incoming() {
             let Ok(client) = incoming else { continue };
             let _ = client.set_nodelay(true);
-            let Ok(reader) = client.try_clone() else {
+            let Ok(mut reader) = client.try_clone() else {
                 continue;
             };
-            let id = accept_generation.fetch_add(1, Ordering::Relaxed);
-            replace_native_client(&accept_active, id, client);
+            let writer = client;
             let reader_active = accept_active.clone();
+            let reader_generation = accept_generation.clone();
             let reader_stdout = accept_stdout.clone();
             std::thread::spawn(move || {
+                // A connect with no framed request is a health probe or a
+                // half-open socket. Promoting it would shut down the live TUI.
+                let Ok(first) = read_frame(&mut reader, MAX_MESSAGE_BYTES) else {
+                    return;
+                };
+                let id = reader_generation.fetch_add(1, Ordering::Relaxed);
+                replace_native_client(&reader_active, id, writer);
+                if !forward_to_native(&first, id, &reader_active, &reader_stdout) {
+                    clear_native_client(&reader_active, id);
+                    return;
+                }
                 relay_client_to_native(reader, id, &reader_active, &reader_stdout);
             });
         }
@@ -272,27 +295,28 @@ fn validate_native_origin() -> Result<()> {
     Ok(())
 }
 
-fn relay_client_to_native(
-    mut socket: StdTcpStream,
+fn forward_to_native(
+    payload: &[u8],
     generation: u64,
     active: &StdArc<StdMutex<Option<NativeClient>>>,
     stdout_gate: &StdArc<StdMutex<()>>,
-) {
-    while let Ok(payload) = read_frame(&mut socket, MAX_MESSAGE_BYTES) {
-        let is_current = active
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|client| client.generation == generation))
-            .unwrap_or(false);
-        if !is_current {
-            break;
-        }
-        let Ok(_gate) = stdout_gate.lock() else { break };
-        let stdout = std::io::stdout();
-        if write_frame(&mut stdout.lock(), &payload).is_err() {
-            break;
-        }
+) -> bool {
+    let is_current = active
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|client| client.generation == generation))
+        .unwrap_or(false);
+    if !is_current {
+        return false;
     }
+    let Ok(_gate) = stdout_gate.lock() else {
+        return false;
+    };
+    let stdout = std::io::stdout();
+    write_frame(&mut stdout.lock(), payload).is_ok()
+}
+
+fn clear_native_client(active: &StdArc<StdMutex<Option<NativeClient>>>, generation: u64) {
     if let Ok(mut slot) = active.lock()
         && slot
             .as_ref()
@@ -300,6 +324,20 @@ fn relay_client_to_native(
     {
         *slot = None;
     }
+}
+
+fn relay_client_to_native(
+    mut socket: StdTcpStream,
+    generation: u64,
+    active: &StdArc<StdMutex<Option<NativeClient>>>,
+    stdout_gate: &StdArc<StdMutex<()>>,
+) {
+    while let Ok(payload) = read_frame(&mut socket, MAX_MESSAGE_BYTES) {
+        if !forward_to_native(&payload, generation, active, stdout_gate) {
+            break;
+        }
+    }
+    clear_native_client(active, generation);
 }
 
 fn read_frame(reader: &mut impl Read, maximum: usize) -> Result<Vec<u8>> {
@@ -325,6 +363,7 @@ fn write_frame(writer: &mut impl Write, payload: &[u8]) -> Result<()> {
 }
 
 pub struct ExtensionApi {
+    _lock: BridgeLock,
     stream: Mutex<TcpStream>,
     request_id: AtomicU64,
     me: RwLock<Option<User>>,
@@ -332,10 +371,78 @@ pub struct ExtensionApi {
     feed: RwLock<FeedKind>,
 }
 
+/// Keeps a process-wide exclusive file open so a second TUI cannot attach to
+/// the same native-host socket and abort the first session.
+struct BridgeLock {
+    _file: fs::File,
+}
+
+fn acquire_bridge_lock() -> Result<BridgeLock> {
+    let path = Config::path()?
+        .parent()
+        .context("XTUI config path had no parent")?
+        .join("bridge.lock");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let mut file = open_exclusive_lock(&path).with_context(|| {
+        format!(
+            "another XTUI is already using the browser bridge; quit that terminal session first"
+        )
+    })?;
+    file.set_len(0)?;
+    writeln!(file, "{}", std::process::id())?;
+    file.flush()?;
+    Ok(BridgeLock { _file: file })
+}
+
+#[cfg(windows)]
+fn open_exclusive_lock(path: &Path) -> Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    Ok(fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(path)?)
+}
+
+#[cfg(not(windows))]
+fn open_exclusive_lock(path: &Path) -> Result<fs::File> {
+    if let Ok(existing) = fs::read_to_string(path)
+        && let Ok(pid) = existing.trim().parse::<i32>()
+        && process_is_alive(pid)
+    {
+        bail!("bridge lock is held by pid {pid}");
+    }
+    Ok(fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?)
+}
+
+#[cfg(not(windows))]
+fn process_is_alive(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+fn reregister_native_host() {
+    if let Ok(executable) = std::env::current_exe() {
+        let _ = register_native_host(BrowserTarget::Edge, &executable);
+        let _ = register_native_host(BrowserTarget::Chrome, &executable);
+    }
+}
+
 impl ExtensionApi {
     pub async fn connect() -> Result<Self> {
+        let lock = acquire_bridge_lock()?;
+        reregister_native_host();
         let stream = connect_stream().await?;
         let api = Self {
+            _lock: lock,
             stream: Mutex::new(stream),
             request_id: AtomicU64::new(1),
             me: RwLock::new(None),
@@ -352,7 +459,7 @@ impl ExtensionApi {
             .get("extension_version")
             .and_then(Value::as_str)
             .unwrap_or("older than 0.2.4");
-        if running_version != env!("CARGO_PKG_VERSION") {
+        if !extension_version_supported(running_version) {
             bail!(
                 "Edge is running XTUI extension {running_version}, but the CLI is {}; open edge://extensions and click Reload on XTUI",
                 env!("CARGO_PKG_VERSION")
@@ -369,17 +476,33 @@ impl ExtensionApi {
             bail!("extension request exceeded {MAX_MESSAGE_BYTES} bytes")
         }
         let mut stream = self.stream.lock().await;
-        let first_error = match exchange(&mut stream, &payload, id).await {
-            Ok(response) => return Ok(response),
-            Err(error) => error,
-        };
-        *stream = connect_stream().await?;
-        exchange(&mut stream, &payload, id).await.with_context(|| {
-            format!(
-                "browser bridge request failed after reconnect (first failure: {})",
-                first_error
-            )
-        })
+        let mut first_error = None;
+        for attempt in 0..3 {
+            match exchange(&mut stream, &payload, id).await {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    let retryable = bridge_error_is_retryable(&error);
+                    if first_error.is_none() {
+                        first_error = Some(error.to_string());
+                    }
+                    if !retryable || attempt + 1 == 3 {
+                        return Err(error).with_context(|| {
+                            if attempt == 0 {
+                                "browser bridge request failed".to_owned()
+                            } else {
+                                format!(
+                                    "browser bridge request failed after reconnect (first failure: {})",
+                                    first_error.as_deref().unwrap_or("none")
+                                )
+                            }
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_millis(120 * (attempt as u64 + 1))).await;
+                    *stream = connect_stream().await?;
+                }
+            }
+        }
+        unreachable!("bridge retry loop always returns")
     }
 
     async fn page(&self, op: &str, cursor: Option<&str>, fields: Value) -> Result<Page<Post>> {
@@ -419,14 +542,39 @@ impl ExtensionApi {
 }
 
 async fn connect_stream() -> Result<TcpStream> {
-    let stream = timeout(Duration::from_secs(3), TcpStream::connect(BRIDGE_ADDRESS))
-        .await
-        .map_err(|_| anyhow!("timed out connecting to the XTUI browser extension"))?
-        .context(
-            "the XTUI browser extension is not connected; load it and keep the browser running",
-        )?;
-    stream.set_nodelay(true)?;
-    Ok(stream)
+    let mut last = None;
+    for attempt in 0..4 {
+        match timeout(Duration::from_secs(3), TcpStream::connect(BRIDGE_ADDRESS)).await {
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+            Ok(Err(error)) => last = Some(anyhow!(error)),
+            Err(_) => {
+                last = Some(anyhow!(
+                    "timed out connecting to the XTUI browser extension"
+                ));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
+    }
+    Err(last.unwrap_or_else(|| {
+        anyhow!("the XTUI browser extension is not connected; load it and keep the browser running")
+    })
+    .context(
+        "the XTUI browser extension is not connected; load it and keep the browser running",
+    ))
+}
+
+fn bridge_error_is_retryable(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_ascii_lowercase();
+    text.contains("aborted")
+        || text.contains("connection reset")
+        || text.contains("broken pipe")
+        || text.contains("os error 10053")
+        || text.contains("os error 10054")
+        || text.contains("os error 104")
+        || text.contains("forcibly closed")
 }
 
 async fn exchange<T: DeserializeOwned>(
@@ -585,6 +733,10 @@ impl Api for ExtensionApi {
         *self.feed.write().await = feed;
     }
 
+    async fn release_secondary(&self) {
+        let _: Result<Value> = self.call(json!({ "op": "release_secondary" })).await;
+    }
+
     async fn home(&self, next: Option<&str>) -> Result<Page<Post>> {
         let feed = match *self.feed.read().await {
             FeedKind::Following => "following",
@@ -655,12 +807,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn current_and_previous_extension_builds_are_accepted() {
+        assert!(extension_version_supported(env!("CARGO_PKG_VERSION")));
+        assert!(extension_version_supported("0.3.2"));
+        assert!(extension_version_supported("0.3.3"));
+        assert!(extension_version_supported("0.3.4"));
+        assert!(extension_version_supported("0.3.5"));
+        assert!(extension_version_supported("0.3.6"));
+        assert!(!extension_version_supported("0.2.4"));
+    }
+
+    #[test]
+    fn dropped_sockets_are_retried_but_application_errors_are_not() {
+        assert!(bridge_error_is_retryable(&anyhow::anyhow!(
+            "An established connection was aborted by the software in your host machine"
+        )));
+        assert!(bridge_error_is_retryable(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(!bridge_error_is_retryable(&anyhow::anyhow!(
+            "unsupported operation: home"
+        )));
+    }
+
+    #[test]
     fn embedded_manifest_has_stable_extension_identity() {
         let manifest: Value =
             serde_json::from_str(include_str!("../extension/manifest.json")).unwrap();
         assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(EXTENSION_ID.len(), 32);
         assert_eq!(manifest["host_permissions"], json!(["https://x.com/*"]));
+        assert!(
+            EXTENSION_FILES
+                .iter()
+                .any(|(path, _)| *path == "interceptor.js"),
+            "the installed extension must include the main-world timeline interceptor"
+        );
     }
 
     #[test]
@@ -668,6 +850,29 @@ mod tests {
         let length = ((MAX_MESSAGE_BYTES + 1) as u32).to_le_bytes();
         let error = read_frame(&mut length.as_slice(), MAX_MESSAGE_BYTES).unwrap_err();
         assert!(error.to_string().contains("exceeded"));
+    }
+
+    #[test]
+    fn a_connect_without_a_request_does_not_displace_the_live_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let first_client = StdTcpStream::connect(address).unwrap();
+        let (first_server, _) = listener.accept().unwrap();
+        let active = StdArc::new(StdMutex::new(None));
+        replace_native_client(&active, 7, first_server);
+
+        let probe = StdTcpStream::connect(address).unwrap();
+        drop(probe);
+        assert_eq!(
+            active
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|client| client.generation),
+            Some(7),
+            "an empty connect must not take the live session"
+        );
+        drop(first_client);
     }
 
     #[test]

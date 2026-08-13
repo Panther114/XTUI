@@ -1,10 +1,42 @@
 use crate::model::{Media, MediaKind};
 use anyhow::{Context, Result};
-use image::GenericImageView;
-use std::{io::Cursor, time::Duration};
+use image::{DynamicImage, ImageBuffer, Rgb};
+use ratatui::layout::Rect;
+use ratatui_image::{
+    FontSize, Resize, StatefulImage,
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+};
+use std::{
+    collections::HashMap,
+    env,
+    io::Cursor,
+    time::Duration,
+};
 
 const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(30);
+pub const INLINE_MAX_COLS: u16 = 56;
+pub const INLINE_MAX_ROWS: u16 = 16;
+pub const PREVIEW_MAX_ROWS: u16 = 10;
+pub const MODAL_MAX_COLS: u16 = 72;
+pub const MODAL_MAX_ROWS: u16 = 28;
+
+/// Decoded still used for native terminal graphics (Sixel / Kitty / iTerm2).
+#[derive(Clone, Debug)]
+pub struct PreviewImage {
+    pub source: DynamicImage,
+}
+
+impl PreviewImage {
+    pub fn width(&self) -> u32 {
+        self.source.width()
+    }
+
+    pub fn height(&self) -> u32 {
+        self.source.height()
+    }
+}
 
 pub fn best_external_url(media: &Media) -> Option<String> {
     if matches!(media.kind, MediaKind::Video | MediaKind::AnimatedGif) {
@@ -21,13 +53,37 @@ pub fn best_external_url(media: &Media) -> Option<String> {
     }
 }
 
-pub async fn download_preview(url: &str, max_width: u32, max_height: u32) -> Result<Vec<String>> {
-    if url.starts_with("demo://") {
-        return Ok(demo_preview(max_width.min(60) as usize));
+/// Still image used inside the TUI. Videos and GIFs prefer their poster
+/// frame so we never try to decode an MP4 as a photo.
+pub fn best_preview_url(media: &Media) -> Option<String> {
+    if let Some(url) = media.preview_url.clone() {
+        return Some(url);
     }
-    // A hung CDN must never freeze the UI: the event loop awaits this call.
+    let url = media.url.clone()?;
+    if url.starts_with("demo://") || looks_like_image(&url) {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+fn looks_like_image(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+}
+
+pub async fn download_preview(url: &str) -> Result<PreviewImage> {
+    if url.starts_with("demo://") {
+        return Ok(demo_preview());
+    }
     let client = reqwest::Client::builder()
-        .user_agent("XTUI/0.1")
+        .user_agent("XTUI/0.3")
         .timeout(PREVIEW_TIMEOUT)
         .build()?;
     let mut response = client.get(url).send().await?.error_for_status()?;
@@ -41,64 +97,192 @@ pub async fn download_preview(url: &str, max_width: u32, max_height: u32) -> Res
         }
         bytes.extend_from_slice(&chunk);
     }
-    tokio::task::spawn_blocking(move || render_halfblocks(&bytes, max_width, max_height)).await?
+    tokio::task::spawn_blocking(move || decode_image(&bytes)).await?
 }
 
-fn demo_preview(width: usize) -> Vec<String> {
-    let width = width.max(24);
-    let mut lines = vec![" ".repeat(width); 16];
-    lines[1] = format!("┌{}┐", "─".repeat(width.saturating_sub(2)));
-    lines[14] = format!("└{}┘", "─".repeat(width.saturating_sub(2)));
-    for line in lines.iter_mut().take(14).skip(2) {
-        *line = format!("│{}│", " ".repeat(width.saturating_sub(2)));
-    }
-    for (row, text) in [
-        (3, "XTUI  /  HOME"),
-        (7, "@ada_codes  ·  now"),
-        (9, "A quieter way to read the timeline."),
-        (11, "◯ 38    ↻ 226    ♡ 2.4K"),
-    ] {
-        let clipped: String = text.chars().take(width.saturating_sub(8)).collect();
-        let remaining = width.saturating_sub(5 + clipped.chars().count());
-        lines[row] = format!("│   {clipped}{}│", " ".repeat(remaining));
-    }
-    lines
-}
-
-fn render_halfblocks(bytes: &[u8], max_width: u32, max_height: u32) -> Result<Vec<String>> {
+fn decode_image(bytes: &[u8]) -> Result<PreviewImage> {
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .context("media format could not be detected")?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(64 * 1024 * 1024);
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(48 * 1024 * 1024);
     reader.limits(limits);
-    let image = reader
+    let source = reader
         .decode()
-        .context("media is not a supported or safely sized image")?
-        .grayscale();
-    let (w, h) = image.dimensions();
-    let scale = (max_width as f32 / w as f32)
-        .min((max_height * 2) as f32 / h as f32)
-        .min(1.0);
-    let target_w = ((w as f32 * scale).round() as u32).max(1);
-    let target_h = ((h as f32 * scale).round() as u32).max(2);
-    let resized = image
-        .resize_exact(target_w, target_h, image::imageops::FilterType::Triangle)
-        .to_luma8();
-    let levels = [' ', '░', '▒', '▓', '█'];
-    let mut lines = Vec::new();
-    for y in (0..target_h).step_by(2) {
-        let mut line = String::new();
-        for x in 0..target_w {
-            let top = resized.get_pixel(x, y)[0] as usize;
-            let bottom = resized.get_pixel(x, (y + 1).min(target_h - 1))[0] as usize;
-            line.push(levels[((top + bottom) / 2) * levels.len() / 256]);
+        .context("media is not a supported or safely sized image")?;
+    Ok(PreviewImage { source })
+}
+
+fn demo_preview() -> PreviewImage {
+    let width = 320u32;
+    let height = 180u32;
+    let buffer = ImageBuffer::from_fn(width, height, |x, y| {
+        let edge = x < 8 || y < 8 || x + 8 >= width || y + 8 >= height;
+        if edge {
+            Rgb([210, 210, 210])
+        } else {
+            let t = x as f32 / width as f32;
+            let luma = 28 + (t * 90.0) as u8;
+            Rgb([luma, luma, luma.saturating_add(8)])
         }
-        lines.push(line);
+    });
+    PreviewImage {
+        source: DynamicImage::ImageRgb8(buffer),
     }
-    Ok(lines)
+}
+
+/// Detects Sixel / Kitty / iTerm2 after the alternate screen is up, and
+/// keeps per-URL protocol state so images can be painted as real pixels.
+pub struct ImageEngine {
+    picker: Picker,
+    states: HashMap<String, StatefulProtocol>,
+}
+
+impl ImageEngine {
+    pub fn detect() -> Self {
+        let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        if picker.protocol_type() == ProtocolType::Halfblocks {
+            if let Some(forced) = forced_graphics_protocol() {
+                let font = window_font_size()
+                    .unwrap_or_else(|| picker.font_size())
+                    .max_or_default();
+                #[allow(deprecated)]
+                let mut next = Picker::from_fontsize(font);
+                next.set_protocol_type(forced);
+                picker = next;
+            }
+        }
+        Self {
+            picker,
+            states: HashMap::new(),
+        }
+    }
+
+    pub fn font_size(&self) -> FontSize {
+        self.picker.font_size()
+    }
+
+    pub fn drop_url(&mut self, url: &str) {
+        self.states.remove(url);
+    }
+
+    pub fn slot_size(
+        &self,
+        image: &PreviewImage,
+        max_cols: u16,
+        max_rows: u16,
+    ) -> (u16, u16) {
+        fit_cells(image, self.font_size(), max_cols, max_rows)
+    }
+
+    pub fn render(
+        &mut self,
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        url: &str,
+        image: &PreviewImage,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        if !self.states.contains_key(url) {
+            self.states.insert(
+                url.to_string(),
+                self.picker.new_resize_protocol(image.source.clone()),
+            );
+        }
+        let Some(state) = self.states.get_mut(url) else {
+            return;
+        };
+        frame.render_stateful_widget(
+            StatefulImage::new().resize(Resize::Fit(None)),
+            area,
+            state,
+        );
+    }
+}
+
+trait FontSizeExt {
+    fn max_or_default(self) -> FontSize;
+}
+
+impl FontSizeExt for FontSize {
+    fn max_or_default(self) -> FontSize {
+        if self.width == 0 || self.height == 0 {
+            FontSize::new(10, 20)
+        } else {
+            self
+        }
+    }
+}
+
+pub fn default_font() -> FontSize {
+    window_font_size().unwrap_or(FontSize::new(10, 20))
+}
+
+pub fn fit_cells(
+    image: &PreviewImage,
+    font: FontSize,
+    max_cols: u16,
+    max_rows: u16,
+) -> (u16, u16) {
+    let font = font.max_or_default();
+    let max_cols = max_cols.max(1);
+    let max_rows = max_rows.max(1);
+    let native_cols = (image.width() as f32 / f32::from(font.width)).ceil().max(1.0);
+    let native_rows = (image.height() as f32 / f32::from(font.height))
+        .ceil()
+        .max(1.0);
+    let scale = (f32::from(max_cols) / native_cols)
+        .min(f32::from(max_rows) / native_rows)
+        .min(1.0);
+    let cols = (native_cols * scale).round().clamp(1.0, f32::from(max_cols)) as u16;
+    let rows = (native_rows * scale).round().clamp(1.0, f32::from(max_rows)) as u16;
+    (cols, rows)
+}
+
+fn forced_graphics_protocol() -> Option<ProtocolType> {
+    if env::var_os("WT_SESSION").is_some() || env::var("TERM_PROGRAM").ok().as_deref() == Some("vscode")
+    {
+        return Some(ProtocolType::Sixel);
+    }
+    match env::var("TERM_PROGRAM").ok().as_deref() {
+        Some("WezTerm") | Some("iTerm.app") | Some("Bobcat") => {
+            return Some(ProtocolType::Iterm2);
+        }
+        Some("ghostty") => return Some(ProtocolType::Kitty),
+        _ => {}
+    }
+    if env::var_os("KITTY_WINDOW_ID").is_some()
+        || env::var("TERM").ok().is_some_and(|term| term.contains("kitty"))
+    {
+        return Some(ProtocolType::Kitty);
+    }
+    if env::var("TERM")
+        .ok()
+        .is_some_and(|term| term.contains("sixel") || term.contains("mlterm") || term.contains("foot"))
+    {
+        return Some(ProtocolType::Sixel);
+    }
+    #[cfg(windows)]
+    {
+        return Some(ProtocolType::Sixel);
+    }
+    #[cfg(not(windows))]
+    None
+}
+
+fn window_font_size() -> Option<FontSize> {
+    let size = crossterm::terminal::window_size().ok()?;
+    if size.width == 0 || size.height == 0 || size.columns == 0 || size.rows == 0 {
+        return None;
+    }
+    Some(FontSize::new(
+        (size.width / size.columns).max(1),
+        (size.height / size.rows).max(1),
+    ))
 }
 
 #[cfg(test)]
@@ -129,10 +313,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demo_preview_is_offline_and_bordered() {
-        let lines = download_preview("demo://terminal", 40, 20).await.unwrap();
-        assert!(lines.iter().any(|line| line.contains("XTUI")));
-        assert!(lines.first().unwrap().trim().is_empty());
-        assert!(lines[1].starts_with('┌'));
+    async fn demo_preview_is_offline_and_sized() {
+        let image = download_preview("demo://terminal").await.unwrap();
+        assert!(image.width() >= 160);
+        assert!(image.height() >= 80);
+    }
+
+    #[test]
+    fn preview_url_prefers_stills_over_video_files() {
+        let video = Media {
+            key: "v".into(),
+            kind: MediaKind::Video,
+            url: Some("https://example.test/clip.mp4".into()),
+            preview_url: Some("https://example.test/poster.jpg".into()),
+            alt_text: None,
+            variants: vec![],
+        };
+        assert_eq!(
+            best_preview_url(&video).as_deref(),
+            Some("https://example.test/poster.jpg")
+        );
+        let bare = Media {
+            preview_url: None,
+            ..video.clone()
+        };
+        assert_eq!(best_preview_url(&bare), None);
+    }
+
+    #[test]
+    fn fit_cells_caps_the_slot() {
+        let image = demo_preview();
+        let (cols, rows) = fit_cells(&image, FontSize::new(10, 20), 20, 8);
+        assert!(cols <= 20);
+        assert!(rows <= 8);
+        assert!(cols >= 1 && rows >= 1);
     }
 }

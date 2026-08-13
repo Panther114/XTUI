@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use std::{
     io::{self, stdout},
@@ -30,11 +30,12 @@ use std::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 mod landing;
+mod motion;
 pub mod screenshot;
 
-/// XTUI's visual language is intentionally achromatic: a true-black canvas,
-/// white type, and a small grayscale ramp for hierarchy. Semantic state is
-/// communicated through copy, glyphs, weight, and inversion rather than hue.
+/// XTUI's visual language is a true-black canvas, white type, and a small
+/// grayscale ramp for hierarchy. Author names are the one reserved hue: a
+/// cool steel that sits next to the gray ramp instead of a stock sky blue.
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub white: Color,
@@ -43,6 +44,7 @@ pub struct Theme {
     pub surface: Color,
     pub surface_raised: Color,
     pub accent: Color,
+    pub author: Color,
     pub green: Color,
     pub amber: Color,
     pub red: Color,
@@ -58,6 +60,7 @@ impl Default for Theme {
             surface: Color::Rgb(0, 0, 0),
             surface_raised: Color::Rgb(18, 18, 18),
             accent: Color::Rgb(255, 255, 255),
+            author: Color::Rgb(168, 196, 214),
             green: Color::Rgb(220, 220, 220),
             amber: Color::Rgb(190, 190, 190),
             red: Color::Rgb(255, 255, 255),
@@ -102,6 +105,10 @@ fn theme() -> &'static Theme {
     THEME.get_or_init(Theme::default)
 }
 
+fn gray(luma: u8) -> Color {
+    Color::Rgb(luma, luma, luma)
+}
+
 fn parse_hex(input: &str) -> Option<Color> {
     let hex = input.strip_prefix('#').unwrap_or(input);
     if hex.len() != 6 {
@@ -139,6 +146,9 @@ pub async fn run(app: &mut App) -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    // Query graphics capabilities after the alternate screen is up so Sixel /
+    // Kitty / iTerm2 can paint real pixels instead of unicode blocks.
+    app.attach_image_engine();
     // Paint the initial frame before bootstrap: a browser-extension connect
     // can take several seconds and must never leave a blank alternate screen.
     terminal.draw(|frame| draw(frame, app))?;
@@ -171,15 +181,17 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
     app.request_bootstrap();
     let mut last_idle_redraw = Instant::now();
     let mut last_auto_refresh = Instant::now();
-    let mut last_landing_motion_frame = landing::motion_frame();
+    let mut last_landing_motion_frame = landing_motion_frame(app);
     while !app.should_quit {
         // While work is in flight the poll window shrinks to a tick so the
         // spinner animates; otherwise XTUI sleeps until a key, mouse, resize
         // or the 30 s relative-time refresh.
-        let busy = app.has_pending();
+        let busy = app.has_pending() || app.has_media_inflight();
         let landing_motion = matches!(app.screen, Screen::Landing);
-        let timeout = if busy || landing_motion || app.browser_mode {
+        let timeout = if busy || app.browser_mode {
             Duration::from_millis(125)
+        } else if motion::enabled() && landing_motion {
+            Duration::from_millis(80)
         } else {
             Duration::from_secs(30)
         };
@@ -187,7 +199,10 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
         let mut input_changed = false;
         if event {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                Event::Key(key)
+                    if key.kind == KeyEventKind::Press
+                        || (key.kind == KeyEventKind::Repeat && key_repeats(key.code)) =>
+                {
                     handle_key(app, key);
                     input_changed = true;
                 }
@@ -219,18 +234,23 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
         }
         let changed = app.process_messages();
         let prefetched = app.maintain_read_ahead();
-        let landing_motion_frame = landing::motion_frame();
-        let landing_motion_changed =
-            landing_motion && landing_motion_frame != last_landing_motion_frame;
+        let landing_motion_frame = landing_motion_frame(app);
+        let landing_motion_changed = motion::enabled()
+            && matches!(app.screen, Screen::Landing)
+            && landing_motion_frame != last_landing_motion_frame;
         // Silent background refresh keeps Home live without stealing focus.
-        if app.auto_refresh_secs > 0
+        let refresh_interval = if app.browser_mode {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(app.auto_refresh_secs)
+        };
+        if (app.browser_mode || app.auto_refresh_secs > 0)
             && !app.demo
-            && !app.browser_mode
             && app.mode == InputMode::Normal
             && !app.nav_focused
             && matches!(app.screen, Screen::Home)
             && !app.has_pending()
-            && last_auto_refresh.elapsed() >= Duration::from_secs(app.auto_refresh_secs)
+            && last_auto_refresh.elapsed() >= refresh_interval
         {
             app.request_screen(Screen::Home, true);
             last_auto_refresh = Instant::now();
@@ -252,6 +272,31 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
         }
     }
     Ok(())
+}
+
+fn key_repeats(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Backspace
+            | KeyCode::Char('j')
+            | KeyCode::Char('k')
+    )
+}
+
+fn landing_motion_frame(app: &App) -> u64 {
+    if matches!(app.screen, Screen::Landing) {
+        landing::motion_frame()
+    } else {
+        0
+    }
 }
 
 fn handle_click(app: &mut App, row: u16, column: u16) {
@@ -440,80 +485,128 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if matches!(app.screen, Screen::Landing) {
         landing::render(frame, area, app);
         if app.help {
-            render_help(frame, area);
+            render_help(frame, area, app);
         }
         return;
     }
-    if area.width >= 104 {
-        let cols = Layout::horizontal([
-            Constraint::Length(20),
-            Constraint::Length(1),
-            Constraint::Min(50),
-            Constraint::Length(1),
-            Constraint::Length(30),
-        ])
-        .split(area);
+    if area.width >= 78 {
+        let cols = Layout::horizontal([Constraint::Length(18), Constraint::Min(48)]).split(area);
         render_nav(frame, cols[0], app, false);
-        render_center(frame, cols[2], app);
-        render_context(frame, cols[4], app);
-    } else if area.width >= 78 {
-        let cols = Layout::horizontal([
-            Constraint::Length(11),
-            Constraint::Length(1),
-            Constraint::Min(50),
-        ])
-        .split(area);
-        render_nav(frame, cols[0], app, true);
-        render_center(frame, cols[2], app);
+        render_center(frame, cols[1], app);
     } else {
-        let rows = Layout::vertical([Constraint::Min(10), Constraint::Length(3)]).split(area);
+        let rows = Layout::vertical([Constraint::Min(10), Constraint::Length(2)]).split(area);
         render_center(frame, rows[0], app);
         render_bottom_nav(frame, rows[1], app);
     }
     if app.help {
-        render_help(frame, area);
+        render_help(frame, area, app);
     }
-    if let Some((alt, lines)) = &app.media_preview {
-        render_media(frame, area, alt, lines);
+    if app.media_preview.is_some() {
+        render_media(frame, area, app);
     }
+}
+
+/// Landing-page X, then plain "tui". The six-row letter is 8 columns; the
+/// lockup stays inside the 17-column rail.
+const NAV_X: &[&str] = &[
+    "██╗  ██╗",
+    "╚██╗██╔╝",
+    " ╚███╔╝ ",
+    " ██╔██╗ ",
+    "██╔╝ ██╗",
+    "╚═╝  ╚═╝",
+];
+const NAV_X_LUMA: [u8; 6] = [226, 205, 184, 164, 142, 122];
+
+fn render_nav_wordmark_text(frame: &mut Frame, area: Rect) -> u16 {
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "xtui",
+            Style::default()
+                .fg(theme().white)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        Rect {
+            height: area.height.min(1),
+            ..area
+        },
+    );
+    1
+}
+
+fn render_nav_wordmark(frame: &mut Frame, area: Rect) -> u16 {
+    if area.height < 6 || area.width < 12 {
+        return render_nav_wordmark_text(frame, area);
+    }
+    let lines: Vec<Line> = NAV_X
+        .iter()
+        .enumerate()
+        .map(|(index, letter)| {
+            let mut spans = vec![Span::styled(
+                *letter,
+                Style::default()
+                    .fg(gray(NAV_X_LUMA[index]))
+                    .add_modifier(Modifier::BOLD),
+            )];
+            // Pad every row to the same width so centering does not jog the X.
+            spans.push(Span::styled(
+                if index == 5 { " tui" } else { "    " },
+                Style::default().fg(theme().white).add_modifier(Modifier::BOLD),
+            ));
+            Line::from(spans).alignment(Alignment::Center)
+        })
+        .collect();
+    let mark_height = lines.len() as u16;
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            height: area.height.min(mark_height),
+            ..area
+        },
+    );
+    mark_height
 }
 
 fn render_nav(frame: &mut Frame, area: Rect, app: &mut App, compact: bool) {
     let active = app.nav_index();
-    let items: &[(&str, &str)] = &[
-        ("⌂", "Home"),
-        ("◇", "Explore"),
-        ("@", "Mentions"),
-        ("◆", "Bookmarks"),
-        ("≡", "Lists"),
-    ];
-    let mut lines = Vec::with_capacity(items.len() * 2 + 2);
-    lines.push(Line::from(Span::styled(
-        if compact { "  𝕏  " } else { "  𝕏  XTUI" },
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(""));
-    for (index, (icon, label)) in items.iter().enumerate() {
+    let items = ["Home", "Explore", "Mentions", "Bookmarks", "Lists"];
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(theme().dim))
+            .style(Style::default().bg(theme().background)),
+        area,
+    );
+    let inner = Rect {
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    let mark_height = if compact {
+        render_nav_wordmark_text(frame, inner)
+    } else {
+        render_nav_wordmark(frame, inner)
+    };
+
+    let stride = 2u16;
+    let nav_top = area.y.saturating_add(mark_height.saturating_add(2));
+    for (index, label) in items.iter().enumerate() {
+        let y = nav_top.saturating_add(index as u16 * stride);
+        if y >= area.bottom() {
+            break;
+        }
         let is_active = index == active;
         let is_focused = app.nav_focused && index == app.nav_selected;
         let is_hovered = app.hovered == Some(HitAction::Nav(index));
-        // While the sidebar owns focus, only the focused item keeps the accent
-        // bar; the current section drops to a neutral marker so focus pops.
-        let bar = if is_focused || (is_active && !app.nav_focused) {
-            "▍"
+        let marker = if is_focused || (is_active && !app.nav_focused) || is_hovered {
+            ">"
         } else {
             " "
         };
-        let text = if compact {
-            format!("{bar} {icon}")
-        } else {
-            format!("{bar} {icon} {label}")
-        };
         let style = if is_focused {
             Style::default()
-                .fg(theme().accent)
+                .fg(theme().background)
+                .bg(theme().white)
                 .add_modifier(Modifier::BOLD)
         } else if is_hovered {
             Style::default()
@@ -527,55 +620,68 @@ fn render_nav(frame: &mut Frame, area: Rect, app: &mut App, compact: bool) {
         } else {
             Style::default().fg(theme().gray)
         };
-        lines.push(Line::from(Span::styled(text, style)));
-        lines.push(Line::from(""));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{marker} {label}"), style),
+            ]))
+            .alignment(Alignment::Center)
+            .style(style),
+            Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            },
+        );
         app.register_hit(
-            area.x,
-            area.y.saturating_add(2 + index as u16 * 2),
-            area.width,
-            1,
+            inner.x,
+            y,
+            inner.width,
+            stride.saturating_sub(1).max(1),
             HitAction::Nav(index),
         );
     }
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme().background)),
-        area,
-    );
+
     if !compact {
-        let width = area.width as usize;
-        let (name, handle) = match app.me.as_ref() {
-            Some(user) => (
-                truncate_to_width(&user.name, width.saturating_sub(4)),
-                truncate_to_width(&user.username, width.saturating_sub(4)),
-            ),
-            None => ("Demo".into(), "offline account".into()),
-        };
-        let a = Rect {
-            x: area.x,
-            y: area.bottom().saturating_sub(4),
-            width: area.width,
-            height: 3,
+        let width = inner.width as usize;
+        let handle = app
+            .me
+            .as_ref()
+            .map(|user| truncate_to_width(&user.username, width.saturating_sub(2)))
+            .unwrap_or_else(|| "demo".into());
+        let account = Rect {
+            x: inner.x,
+            y: inner.bottom().saturating_sub(2),
+            width: inner.width,
+            height: 1,
         };
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled("●  ", Style::default().fg(theme().green)),
-                    Span::styled(
-                        name,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    format!("   @{handle}"),
-                    Style::default().fg(theme().gray),
-                )),
-            ])
+            Paragraph::new(Line::from(Span::styled(
+                format!("@{handle}"),
+                Style::default().fg(theme().gray),
+            )))
+            .alignment(Alignment::Center)
             .style(Style::default().bg(theme().background)),
-            a,
+            account,
         );
     }
+}
+
+fn render_card_rail(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let lines = vec![
+        Line::from(Span::styled(
+            "┃",
+            Style::default()
+                .fg(theme().white)
+                .bg(theme().surface_raised)
+                .add_modifier(Modifier::BOLD),
+        ));
+        area.height as usize
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_bottom_nav(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -591,7 +697,8 @@ fn render_bottom_nav(frame: &mut Frame, area: Rect, app: &mut App) {
                         format!(" {l} "),
                         if i == active {
                             Style::default()
-                                .fg(theme().accent)
+                                .fg(theme().background)
+                                .bg(theme().white)
                                 .add_modifier(Modifier::BOLD)
                         } else if app.hovered == Some(HitAction::Nav(i)) {
                             Style::default()
@@ -607,41 +714,12 @@ fn render_bottom_nav(frame: &mut Frame, area: Rect, app: &mut App) {
             })
             .collect::<Vec<_>>(),
     );
-    let keys = Line::from(vec![
-        Span::styled(
-            "↑↓/jk",
-            Style::default()
-                .fg(theme().accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" move  ", Style::default().fg(theme().gray)),
-        Span::styled(
-            "→",
-            Style::default()
-                .fg(theme().accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" open  ", Style::default().fg(theme().gray)),
-        Span::styled(
-            "←",
-            Style::default()
-                .fg(theme().accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " back  / search  ? keys  Q quit",
-            Style::default().fg(theme().gray),
-        ),
-    ])
-    .alignment(Alignment::Right);
     frame.render_widget(
-        Paragraph::new(vec![line, keys])
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(theme().dim)),
-            ),
+        Paragraph::new(line).alignment(Alignment::Center).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme().dim)),
+        ),
         area,
     );
     let segment = area.width / labels.len() as u16;
@@ -652,45 +730,18 @@ fn render_bottom_nav(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             segment
         };
-        app.register_hit(x, area.y, width, 1, HitAction::Nav(index));
+        app.register_hit(x, area.y.saturating_add(1), width, 1, HitAction::Nav(index));
     }
-    let key_row = area.bottom().saturating_sub(1);
-    app.register_hit(
-        area.right().saturating_sub(7),
-        key_row,
-        7,
-        1,
-        HitAction::Quit,
-    );
-    app.register_hit(
-        area.right().saturating_sub(15),
-        key_row,
-        8,
-        1,
-        HitAction::Help,
-    );
-    app.register_hit(
-        area.right().saturating_sub(25),
-        key_row,
-        10,
-        1,
-        HitAction::Search,
-    );
 }
 
 fn render_center(frame: &mut Frame, area: Rect, app: &mut App) {
-    let panel = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme().dim))
-        .style(Style::default().bg(theme().surface));
-    let inner = panel.inner(area);
-    frame.render_widget(panel, area);
     let chunks = Layout::vertical([
         Constraint::Length(header_height(app)),
         Constraint::Min(4),
         Constraint::Length(2),
+        Constraint::Length(1),
     ])
-    .split(inner);
+    .split(area);
     render_header(frame, chunks[0], app);
     if matches!(app.screen, Screen::Lists) {
         render_lists(frame, chunks[1], app);
@@ -710,56 +761,80 @@ fn render_center(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Style::default().fg(theme().green)
     };
-    // Hints are contextual: while typing a search, telling the user about
-    // feed navigation would be noise.
-    let hints = if app.mode == InputMode::Search {
-        "   Enter search · Esc cancel · Ctrl+U clear "
-    } else {
-        "   ↑↓/jk move  → open  ← back  / search  ? help "
-    };
-    let hints_width = hints.width();
     let width = chunks[2].width as usize;
-    let available = width.saturating_sub(3 + hints_width);
-    let mut spans = vec![Span::styled(" ● ", status_style)];
-    if available >= 24 {
-        spans.push(Span::styled(
-            truncate_to_width(&status, available),
+    let indicator = if app.error.is_some() { '!' } else { '·' };
+    let status_line = Line::from(vec![
+        Span::styled(format!(" {indicator} "), status_style),
+        Span::styled(
+            truncate_to_width(&status, width.saturating_sub(4)),
             Style::default().fg(theme().gray),
-        ));
-        spans.push(Span::styled(hints, Style::default().fg(theme().dim)));
-    } else {
-        spans.push(Span::styled(
-            truncate_to_width(&status, width.saturating_sub(3)),
-            Style::default().fg(theme().gray),
-        ));
-    }
+        ),
+    ]);
+    // Status and hints are separate rows so a long error cannot push the
+    // arrow keycaps off the bottom of the screen.
     frame.render_widget(
-        Paragraph::new(Line::from(spans))
-            .alignment(Alignment::Left)
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(theme().dim)),
-            ),
+        Paragraph::new(status_line).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme().dim)),
+        ),
         chunks[2],
     );
-    if app.mode == InputMode::Normal && width >= 24 + hints_width {
-        let key_row = chunks[2].bottom().saturating_sub(1);
+    let hints = if app.mode == InputMode::Search {
+        Line::from(vec![
+            keycap("Enter", true),
+            Span::styled("search   ", Style::default().fg(theme().dim)),
+            keycap("Esc", false),
+            Span::styled("cancel   ", Style::default().fg(theme().dim)),
+            keycap("Ctrl+U", false),
+            Span::styled("clear", Style::default().fg(theme().dim)),
+        ])
+    } else {
+        Line::from(vec![
+            keycap("↑↓", false),
+            Span::styled("move   ", Style::default().fg(theme().dim)),
+            keycap("→", true),
+            Span::styled("open   ", Style::default().fg(theme().dim)),
+            keycap("←", false),
+            Span::styled("back   ", Style::default().fg(theme().dim)),
+            keycap("/", false),
+            Span::styled("search   ", Style::default().fg(theme().dim)),
+            keycap("?", false),
+            Span::styled("help", Style::default().fg(theme().dim)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(hints), chunks[3]);
+    if app.mode == InputMode::Normal && width >= 42 {
+        let key_row = chunks[3].y;
         app.register_hit(
-            chunks[2].right().saturating_sub(8),
+            chunks[3].right().saturating_sub(8),
             key_row,
             8,
             1,
             HitAction::Help,
         );
         app.register_hit(
-            chunks[2].right().saturating_sub(18),
+            chunks[3].right().saturating_sub(18),
             key_row,
             10,
             1,
             HitAction::Search,
         );
     }
+}
+
+fn keycap(label: impl Into<String>, active: bool) -> Span<'static> {
+    let style = if active {
+        Style::default()
+            .fg(theme().background)
+            .bg(theme().white)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme().white)
+            .bg(theme().surface_raised)
+    };
+    Span::styled(format!(" {} ", label.into()), style)
 }
 
 fn header_height(app: &App) -> u16 {
@@ -771,20 +846,25 @@ fn header_height(app: &App) -> u16 {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
-    // Title on the left; position and spinner ride the same line on the right
-    // so both stay visible in every layout, even without a context rail.
+    // Route identity, title, position and activity share one stable line. The
+    // count is treated as a compact instrument readout instead of free text.
     let mut title = Line::from(vec![
         Span::styled(
-            if app.history.is_empty() { "  " } else { "← " },
+            if app.history.is_empty() {
+                "   "
+            } else {
+                " ← "
+            },
             if app.hovered == Some(HitAction::Back) {
                 Style::default()
-                    .fg(theme().white)
-                    .bg(theme().surface_raised)
+                    .fg(theme().background)
+                    .bg(theme().white)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme().accent)
+                Style::default().fg(theme().gray).bg(theme().surface_raised)
             },
         ),
+        Span::raw(" "),
         Span::styled(
             app.title(),
             Style::default()
@@ -793,14 +873,11 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
         ),
     ]);
     let mut right = String::new();
-    if let Some(spinner) = app.spinner_frame() {
-        right.push(spinner);
-        right.push(' ');
-    }
     if !app.posts.is_empty() && !matches!(app.screen, Screen::Lists) {
         right.push_str(&format!("{} / {}", app.selected + 1, app.posts.len()));
     }
     if !right.is_empty() {
+        let right = format!(" {right} ");
         let used = title.width() + right.width() + 1;
         let padding = (area.width as usize).saturating_sub(used);
         title.push_span(Span::raw(" ".repeat(padding)));
@@ -810,8 +887,9 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
                 .fg(if app.has_pending() {
                     theme().accent
                 } else {
-                    theme().gray
+                    theme().white
                 })
+                .bg(theme().surface_raised)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -819,28 +897,33 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut wrap = false;
     match &app.screen {
         Screen::Home => {
-            let label = match app.feed_kind {
-                FeedKind::Following => "Following",
-                FeedKind::ForYou => "For You",
-            };
-            lines.push(Line::from(vec![
+            let hovered = app.hovered == Some(HitAction::ToggleFeed);
+            let following_active = app.feed_kind == FeedKind::Following;
+            let for_you_active = app.feed_kind == FeedKind::ForYou;
+            let segment = |label: &'static str, active: bool| {
                 Span::styled(
-                    format!("  ━━━ {label} ━━━"),
-                    if app.hovered == Some(HitAction::ToggleFeed) {
+                    format!(" {label} "),
+                    if active || hovered {
                         Style::default()
                             .fg(theme().background)
                             .bg(theme().white)
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
-                            .fg(theme().accent)
-                            .add_modifier(Modifier::BOLD)
+                            .fg(if app.browser_mode {
+                                theme().gray
+                            } else {
+                                theme().dim
+                            })
+                            .bg(theme().surface_raised)
                     },
-                ),
-                Span::styled(
-                    if app.browser_mode { "   f toggles" } else { "" },
-                    Style::default().fg(theme().dim),
-                ),
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled("   ", Style::default()),
+                segment("Following", following_active),
+                Span::raw("  "),
+                segment("For You", for_you_active),
             ]));
         }
         Screen::Explore if app.mode == InputMode::Search => lines.push(Line::from(vec![
@@ -977,6 +1060,10 @@ fn render_posts(frame: &mut Frame, area: Rect, app: &mut App) {
         app.selected.min(app.posts.len().saturating_sub(1))
     };
     if app.posts.is_empty() {
+        if app.has_pending() {
+            render_loading(frame, area, app);
+            return;
+        }
         let message: String = if matches!(app.screen, Screen::Explore)
             && app.mode == InputMode::Normal
             && !app.query.trim().is_empty()
@@ -988,15 +1075,22 @@ fn render_posts(frame: &mut Frame, area: Rect, app: &mut App) {
         } else if app.mode == InputMode::Search {
             "  Type a query and press Enter to search X.".into()
         } else if matches!(app.screen, Screen::Thread(_)) && app.has_pending() {
-            "  Loading this conversation and its repliesâ€¦".into()
+            "  Loading this conversation and its replies…".into()
         } else if matches!(app.screen, Screen::Thread(_)) {
             "  This conversation has no posts.".into()
         } else {
             "  Nothing here yet.\n  Press r to refresh or / to search.".into()
         };
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(theme().gray)),
+        let panel = centered(
             area,
+            area.width.saturating_sub(4).min(64),
+            area.height.saturating_sub(2).min(9),
+        );
+        frame.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(theme().gray))
+                .alignment(Alignment::Center),
+            panel,
         );
         return;
     }
@@ -1005,10 +1099,57 @@ fn render_posts(frame: &mut Frame, area: Rect, app: &mut App) {
     // scrolling column instead of a wall of boxes. The feed window begins at
     // the selected post, so reading position stays pinned while rendering
     // stays proportional to the viewport.
-    let width = area.width.saturating_sub(4) as usize;
+    let width = area.width.saturating_sub(5) as usize;
     let thread_view = matches!(app.screen, Screen::Thread(_));
+    let visible: Vec<usize> = app
+        .posts
+        .iter()
+        .enumerate()
+        .skip(selected)
+        .take(if collapsed { 1 } else { 14 })
+        .map(|(index, _)| index)
+        .collect();
+    let pending_urls: Vec<String> = visible
+        .iter()
+        .filter_map(|&index| {
+            app.posts.get(index).and_then(|post| {
+                post.reposted
+                    .as_deref()
+                    .unwrap_or(post)
+                    .media
+                    .first()
+                    .and_then(crate::media::best_preview_url)
+            })
+        })
+        .collect();
+    app.ensure_visible_media(pending_urls);
+    let font = app
+        .image_engine
+        .as_ref()
+        .map(|engine| engine.font_size())
+        .unwrap_or_else(crate::media::default_font);
     if thread_view {
-        let body_limit = area.height.saturating_sub(8).max(3) as usize;
+        let image_rows = app
+            .selected_post()
+            .and_then(|post| {
+                let url = crate::media::best_preview_url(
+                    post.reposted.as_deref().unwrap_or(post).media.first()?,
+                )?;
+                let image = app.cached_media(&url)?;
+                Some(
+                    crate::media::fit_cells(
+                        image,
+                        font,
+                        crate::media::INLINE_MAX_COLS,
+                        crate::media::INLINE_MAX_ROWS,
+                    )
+                    .1,
+                )
+            })
+            .unwrap_or(0);
+        let body_limit = (area.height as usize)
+            .saturating_sub(6 + image_rows as usize)
+            .max(3);
         let total = app
             .selected_post()
             .map(|post| {
@@ -1023,18 +1164,43 @@ fn render_posts(frame: &mut Frame, area: Rect, app: &mut App) {
         app.body_scroll_max = 0;
     }
     let mut y = area.y;
-    for (index, post) in app
-        .posts
-        .iter()
-        .enumerate()
-        .skip(selected)
-        .take(if collapsed { 1 } else { 14 })
-    {
+    for index in visible {
+        let Some(post) = app.posts.get(index) else {
+            break;
+        };
         let focused = index == selected;
         let hovered = app.hovered == Some(HitAction::Card(index));
         let reply = matches!(app.screen, Screen::Thread(_)) && index > 0;
+        let media_url = post
+            .reposted
+            .as_deref()
+            .unwrap_or(post)
+            .media
+            .first()
+            .and_then(crate::media::best_preview_url);
+        let cached = media_url
+            .as_ref()
+            .and_then(|url| app.cached_media(url).cloned());
+        let max_image_rows = if focused {
+            crate::media::INLINE_MAX_ROWS
+        } else {
+            crate::media::PREVIEW_MAX_ROWS
+        };
+        let (image_cols, image_rows) = cached
+            .as_ref()
+            .map(|image| {
+                crate::media::fit_cells(
+                    image,
+                    font,
+                    (width as u16).min(crate::media::INLINE_MAX_COLS),
+                    max_image_rows,
+                )
+            })
+            .unwrap_or((0, 0));
         let body_limit = if focused && thread_view {
-            area.height.saturating_sub(8).max(3) as usize
+            (area.height as usize)
+                .saturating_sub(6 + image_rows as usize)
+                .max(3)
         } else if focused {
             9
         } else {
@@ -1045,39 +1211,94 @@ fn render_posts(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             0
         };
-        let lines = post_lines(post, width, reply, focused, body_limit, body_offset);
+        let (header, footer) = post_lines(post, width, reply, focused, body_limit, body_offset);
         let remaining = area.bottom().saturating_sub(y);
-        // Skip cards that cannot fit at least one content row; a sliver looks
-        // like a rendering bug.
         if remaining < 2 {
             break;
         }
-        let height = (lines.len() as u16 + if focused { 2 } else { 1 }).min(remaining);
-        let block = if focused {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().accent))
-                .style(Style::default().bg(theme().surface_raised))
-        } else if hovered {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().gray))
-                .style(Style::default().bg(theme().surface_raised))
-        } else {
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(theme().dim))
-                .style(Style::default().bg(theme().background))
+        let text_rows = (header.len() + footer.len()) as u16;
+        let content_height =
+            (text_rows.saturating_add(image_rows)).min(remaining.saturating_sub(1).max(1));
+        let height = (content_height + 1).min(remaining);
+        let content = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: content_height,
         };
+        if focused || hovered {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(theme().surface_raised)),
+                content,
+            );
+        }
+        let text_x = if focused {
+            render_card_rail(
+                frame,
+                Rect {
+                    x: content.x,
+                    y: content.y,
+                    width: 1,
+                    height: content.height,
+                },
+            );
+            content.x.saturating_add(1)
+        } else {
+            content.x
+        };
+        let text_width = content.width.saturating_sub(if focused { 1 } else { 0 });
+        let header_h = (header.len() as u16).min(content.height);
         frame.render_widget(
-            Paragraph::new(lines).block(block),
+            Paragraph::new(header),
             Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height,
+                x: text_x,
+                y: content.y,
+                width: text_width,
+                height: header_h,
             },
         );
+        let mut cursor = content.y.saturating_add(header_h);
+        if let (Some(url), Some(image)) = (media_url.as_ref(), cached.as_ref()) {
+            let slot_h = image_rows.min(content.bottom().saturating_sub(cursor));
+            if slot_h > 0 {
+                let slot = Rect {
+                    x: text_x.saturating_add(2),
+                    y: cursor,
+                    width: image_cols.min(text_width.saturating_sub(2)).max(1),
+                    height: slot_h,
+                };
+                if let Some(engine) = app.image_engine.as_mut() {
+                    engine.render(frame, slot, url, image);
+                }
+                cursor = cursor.saturating_add(slot_h);
+            }
+        }
+        let footer_h = (footer.len() as u16).min(content.bottom().saturating_sub(cursor));
+        if footer_h > 0 {
+            frame.render_widget(
+                Paragraph::new(footer),
+                Rect {
+                    x: text_x,
+                    y: cursor,
+                    width: text_width,
+                    height: footer_h,
+                },
+            );
+        }
+        if height > content_height {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "─".repeat(area.width as usize),
+                    Style::default().fg(theme().dim),
+                ))),
+                Rect {
+                    x: area.x,
+                    y: y.saturating_add(content_height),
+                    width: area.width,
+                    height: 1,
+                },
+            );
+        }
         app.card_rows.push((y, y + height, index));
         app.hit_regions.push(HitRegion {
             x: area.x,
@@ -1093,6 +1314,96 @@ fn render_posts(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+fn loading_subject(app: &App) -> &'static str {
+    match app.screen {
+        Screen::Home => "home",
+        Screen::Explore => "search",
+        Screen::Mentions => "mentions",
+        Screen::Bookmarks => "bookmarks",
+        Screen::Lists => "lists",
+        Screen::ListFeed(_) => "list",
+        Screen::Profile(_) => "profile",
+        Screen::Likes(_) => "likes",
+        Screen::Thread(_) => "conversation",
+        Screen::Landing => "session",
+    }
+}
+
+fn render_loading(frame: &mut Frame, area: Rect, app: &App) {
+    let spinner = app.spinner_frame().unwrap_or('·');
+    let bar_width = area.width.saturating_sub(2).max(8) as usize;
+    let block = (bar_width / 4).max(8).min(bar_width);
+    let travel = bar_width.saturating_sub(block).max(1);
+    let cycle_ms = 1400u128;
+    let phase = (app.activity_ms() % cycle_ms) as f32 / cycle_ms as f32;
+    let ping = if phase < 0.5 {
+        phase * 2.0
+    } else {
+        2.0 - phase * 2.0
+    };
+    let start = (ping * travel as f32).round() as usize;
+    let bar: String = (0..bar_width)
+        .map(|index| {
+            if index >= start && index < start + block {
+                '█'
+            } else {
+                '─'
+            }
+        })
+        .collect();
+    let pulse = gray(motion::luma(150, 245, motion::pulse(1.8, 0.0)));
+    let mid = area.y.saturating_add(area.height / 2);
+    let title_y = mid.saturating_sub(2).max(area.y);
+    let bar_y = mid.min(area.bottom().saturating_sub(2));
+    let caption_y = bar_y.saturating_add(2).min(area.bottom().saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "{spinner}  loading {subject}",
+                subject = loading_subject(app)
+            ),
+            Style::default()
+                .fg(theme().white)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .alignment(Alignment::Center),
+        Rect {
+            x: area.x,
+            y: title_y,
+            width: area.width,
+            height: 1,
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(bar, Style::default().fg(pulse)))),
+        Rect {
+            x: area.x.saturating_add(1),
+            y: bar_y,
+            width: area.width.saturating_sub(2).max(1),
+            height: 1,
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Loading posts…",
+                Style::default().fg(theme().gray),
+            )),
+            Line::from(Span::styled(
+                app.status.clone(),
+                Style::default().fg(theme().dim),
+            )),
+        ])
+        .alignment(Alignment::Center),
+        Rect {
+            x: area.x,
+            y: caption_y,
+            width: area.width,
+            height: area.bottom().saturating_sub(caption_y).min(2),
+        },
+    );
+}
+
 fn post_lines(
     post: &Post,
     width: usize,
@@ -1100,7 +1411,7 @@ fn post_lines(
     focused: bool,
     body_limit: usize,
     body_offset: usize,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let mut lines = Vec::new();
     if post.reposted.is_some() {
         lines.push(Line::from(Span::styled(
@@ -1110,10 +1421,11 @@ fn post_lines(
     }
     let prefix = if reply { "  └─ " } else { "  " };
     lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(theme().dim)),
         Span::styled(
-            format!("{prefix}{}", post.author.name),
+            post.author.name.clone(),
             Style::default()
-                .fg(Color::White)
+                .fg(theme().author)
                 .add_modifier(Modifier::BOLD),
         ),
         if post.author.verified {
@@ -1164,7 +1476,7 @@ fn post_lines(
             Span::styled(
                 q.author.name.clone(),
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme().author)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -1203,39 +1515,68 @@ fn post_lines(
             Span::styled(
                 format!(
                     "  {}",
-                    m.alt_text.as_deref().unwrap_or("M preview · V open")
+                    m.alt_text.as_deref().unwrap_or("M enlarge · V open")
                 ),
                 Style::default().fg(theme().gray),
             ),
         ]));
     }
+    let header = lines;
+    let mut footer = Vec::new();
     let metrics = [
         ("◯", compact(target.metrics.reply_count)),
         ("↻", compact(target.metrics.retweet_count)),
         ("♡", compact(target.metrics.like_count)),
         ("◉", compact(target.metrics.impression_count.unwrap_or(0))),
     ];
-    let mut metric_line = String::from("  ");
+    let mut metric_line = vec![Span::raw("  ")];
     for (icon, number) in metrics {
-        metric_line.push_str(icon);
-        metric_line.push(' ');
-        metric_line.push_str(&number);
-        metric_line.push_str("   ");
+        metric_line.push(Span::styled(icon, Style::default().fg(theme().dim)));
+        metric_line.push(Span::styled(
+            format!(" {number} "),
+            Style::default()
+                .fg(if focused { theme().white } else { theme().gray })
+                .bg(if focused {
+                    theme().surface
+                } else {
+                    theme().background
+                }),
+        ));
+        metric_line.push(Span::raw("  "));
     }
-    lines.push(Line::from(Span::styled(
-        metric_line,
-        Style::default().fg(theme().gray),
-    )));
-    lines
+    footer.push(Line::from(metric_line));
+    if focused {
+        footer.push(Line::from(vec![
+            Span::styled("  ENTER", Style::default().fg(theme().white)),
+            Span::styled(" OPEN   ", Style::default().fg(theme().dim)),
+            Span::styled("P", Style::default().fg(theme().white)),
+            Span::styled(" AUTHOR   ", Style::default().fg(theme().dim)),
+            Span::styled("M", Style::default().fg(theme().white)),
+            Span::styled(" MEDIA   ", Style::default().fg(theme().dim)),
+            Span::styled("O", Style::default().fg(theme().white)),
+            Span::styled(" X.COM", Style::default().fg(theme().dim)),
+        ]));
+    }
+    (header, footer)
 }
 
 fn render_lists(frame: &mut Frame, area: Rect, app: &mut App) {
     app.card_rows.clear();
     if app.lists.is_empty() {
-        frame.render_widget(
-            Paragraph::new("  No lists yet.\n  Press r to refresh.")
-                .style(Style::default().fg(theme().gray)),
+        if app.has_pending() {
+            render_loading(frame, area, app);
+            return;
+        }
+        let panel = centered(
             area,
+            area.width.saturating_sub(4).min(60),
+            area.height.saturating_sub(2).min(8),
+        );
+        frame.render_widget(
+            Paragraph::new("No lists yet. Press r to refresh.")
+                .style(Style::default().fg(theme().gray))
+                .alignment(Alignment::Center),
+            panel,
         );
         return;
     }
@@ -1278,23 +1619,15 @@ fn render_lists(frame: &mut Frame, area: Rect, app: &mut App) {
         if remaining < 2 {
             break;
         }
-        let height = (lines.len() as u16 + if focused { 2 } else { 1 }).min(remaining);
-        let block = if focused {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().accent))
-                .style(Style::default().bg(theme().surface_raised))
-        } else if hovered {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().gray))
-                .style(Style::default().bg(theme().surface_raised))
-        } else {
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(theme().dim))
-                .style(Style::default().bg(theme().background))
-        };
+        let height = (lines.len() as u16 + 1).min(remaining);
+        let block = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(theme().dim))
+            .style(Style::default().bg(if focused || hovered {
+                theme().surface_raised
+            } else {
+                theme().background
+            }));
         frame.render_widget(
             Paragraph::new(lines).block(block),
             Rect {
@@ -1319,14 +1652,46 @@ fn render_lists(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+#[allow(dead_code)]
 fn render_context(frame: &mut Frame, area: Rect, app: &App) {
-    let rows = Layout::vertical([Constraint::Min(8), Constraint::Length(1)]).split(area);
+    let rows = Layout::vertical([
+        Constraint::Length(14),
+        Constraint::Length(9),
+        Constraint::Min(6),
+        Constraint::Length(1),
+    ])
+    .split(area);
     let selected = app.selected_post();
     let position = if app.posts.is_empty() {
-        "No post selected".into()
+        "NO SIGNAL SELECTED".into()
     } else {
-        format!("POST {} OF {}", app.selected + 1, app.posts.len())
+        format!("POST {:02} / {:02}", app.selected + 1, app.posts.len())
     };
+    let meter_width = area.width.saturating_sub(8) as usize;
+    let meter_position = if app.posts.is_empty() {
+        0
+    } else {
+        (app.selected * meter_width) / app.posts.len().max(1)
+    };
+    let meter = (0..meter_width)
+        .map(|index| {
+            let luma = if index == meter_position {
+                motion::luma(178, 255, motion::pulse(1.6, 0.0))
+            } else if index < meter_position {
+                112
+            } else {
+                48
+            };
+            Span::styled(
+                if index == meter_position {
+                    "◆"
+                } else {
+                    "━"
+                },
+                Style::default().fg(gray(luma)),
+            )
+        })
+        .collect::<Vec<_>>();
     let summary = vec![
         Line::from(Span::styled(
             position,
@@ -1349,7 +1714,16 @@ fn render_context(frame: &mut Frame, area: Rect, app: &App) {
                 .unwrap_or_default(),
             Style::default().fg(theme().gray),
         )),
-        Line::from(""),
+        Line::from(Span::styled(
+            selected
+                .map(|post| format!("RECEIVED / {}", relative_time(post.created_at)))
+                .unwrap_or_else(|| "AWAITING SIGNAL".into()),
+            Style::default().fg(theme().dim),
+        )),
+        Line::from(Span::styled(
+            "────────────────────────────",
+            Style::default().fg(theme().dim),
+        )),
         Line::from(vec![
             Span::styled(
                 selected
@@ -1370,113 +1744,364 @@ fn render_context(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(" likes", Style::default().fg(theme().gray)),
         ]),
-        Line::from(""),
+        Line::from(meter),
         Line::from(Span::styled(
-            "The selected post stays pinned at the top of the feed.",
-            Style::default().fg(theme().gray),
+            "READ POSITION / PINNED",
+            Style::default().fg(theme().dim),
         )),
     ];
     frame.render_widget(
-        Paragraph::new(summary).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title("  ▍ CURRENT  ")
-                .title_style(
-                    Style::default()
-                        .fg(theme().accent)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().dim))
-                .padding(Padding::uniform(1))
-                .style(Style::default().bg(theme().surface)),
-        ),
+        Paragraph::new(summary)
+            .wrap(Wrap { trim: false })
+            .block(instrument_block("  ▍ CURRENT SIGNAL  ", 0.0)),
         rows[0],
     );
-    // A quiet hint that the full help lives behind `?` — no persistent dock.
+    let commands = vec![
+        context_command(&app.keys.key_label(Action::Open), "OPEN SIGNAL", true),
+        context_command(
+            &app.keys.key_label(Action::Profile),
+            "AUTHOR PROFILE",
+            false,
+        ),
+        context_command(
+            &app.keys.key_label(Action::MediaPreview),
+            "MEDIA PREVIEW",
+            false,
+        ),
+        context_command(
+            &app.keys.key_label(Action::OpenPost),
+            "OPEN ON X.COM",
+            false,
+        ),
+        context_command(&app.keys.key_label(Action::Back), "BACK", false),
+    ];
+    frame.render_widget(
+        Paragraph::new(commands).block(instrument_block("  COMMANDS  ", 0.7)),
+        rows[1],
+    );
+
+    let source = if app.demo {
+        "LOCAL / DEMO"
+    } else if app.browser_mode {
+        "LIVE / EXTENSION"
+    } else {
+        "LIVE / X API"
+    };
+    let buffer = format!("{:03} SIGNALS", app.posts.len());
+    let session = vec![
+        context_value("SOURCE", source),
+        context_value(
+            "FEED",
+            match app.feed_kind {
+                FeedKind::Following => "FOLLOWING",
+                FeedKind::ForYou => "FOR YOU",
+            },
+        ),
+        context_value("BUFFER", &buffer),
+        context_value(
+            "MOTION",
+            if motion::enabled() {
+                "ACTIVE / 6 FPS"
+            } else {
+                "REDUCED"
+            },
+        ),
+    ];
+    frame.render_widget(
+        Paragraph::new(session).block(instrument_block("  SESSION  ", 1.4)),
+        rows[2],
+    );
+
     let footer = Line::from(vec![
-        Span::styled(" ? ", Style::default().fg(theme().accent)),
-        Span::styled("full help   ", Style::default().fg(theme().gray)),
-        Span::styled("Q ", Style::default().fg(theme().accent)),
-        Span::styled("quit", Style::default().fg(theme().gray)),
+        keycap("?", false),
+        Span::styled(" COMMAND INDEX   ", Style::default().fg(theme().gray)),
+        keycap("Q", false),
+        Span::styled(" QUIT", Style::default().fg(theme().gray)),
     ])
     .alignment(Alignment::Right);
     frame.render_widget(
         Paragraph::new(footer).style(Style::default().bg(theme().background)),
-        rows[1],
+        rows[3],
     );
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
-    // The popup must be wide enough that the two-column layout never wraps.
-    let popup = centered(area, 72, 21);
-    frame.render_widget(Clear, popup);
-    let text = "j / ↓        Move down                k / ↑     Move up\ng / G        Top / bottom               → / Enter Open post or selection\nPgUp/PgDn    Jump five posts            ← / Esc    Back / leave\nTab          Sidebar focus              /         Search X\n1…5          Switch section             ?         This help\nP / L        Profile / likes            M / V     Media preview\nR            Refresh                    O         Open on x.com\nF            Following / For You        Space     Collapse thread replies\nQ            Quit\n\nMouse wheel and click also move the selection. The active post stays\npinned to the top; previews underneath show what comes next.\n\nQ / Esc / ?   Close this help";
+fn instrument_block(title: &'static str, offset: f32) -> Block<'static> {
+    Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(gray(motion::luma(156, 245, motion::pulse(2.4, offset))))
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(gray(motion::luma(48, 72, motion::pulse(4.0, offset)))))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(theme().surface))
+}
+
+fn context_command(key: &str, label: &'static str, primary: bool) -> Line<'static> {
+    Line::from(vec![
+        keycap(truncate_to_width(key, 8), primary),
+        Span::styled(format!("  {label}"), Style::default().fg(theme().gray)),
+    ])
+}
+
+fn context_value(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<9}"), Style::default().fg(theme().dim)),
+        Span::styled(value.to_owned(), Style::default().fg(theme().gray)),
+    ])
+}
+
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered(area, 84, 25);
+    let shadow = Rect {
+        x: popup.x.saturating_add(1).min(area.right()),
+        y: popup.y.saturating_add(1).min(area.bottom()),
+        width: popup
+            .width
+            .min(area.right().saturating_sub(popup.x.saturating_add(1))),
+        height: popup
+            .height
+            .min(area.bottom().saturating_sub(popup.y.saturating_add(1))),
+    };
+    frame.render_widget(Clear, shadow);
     frame.render_widget(
-        Paragraph::new(text)
-            .style(Style::default().fg(theme().white))
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title("  KEYBOARD SHORTCUTS  ")
-                    .title_style(
-                        Style::default()
-                            .fg(theme().accent)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme().dim))
-                    .style(Style::default().bg(theme().surface_raised))
-                    .padding(Padding::uniform(2)),
-            ),
-        popup,
+        Block::default().style(Style::default().bg(gray(20))),
+        shadow,
     );
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title("  Keyboard shortcuts  ")
+        .title_style(
+            Style::default()
+                .fg(theme().white)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme().gray))
+        .style(Style::default().bg(theme().surface_raised))
+        .padding(Padding::uniform(1));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let binding = |action| app.keys.bound_keys(action).join(" / ");
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("READ / NAVIGATE", Style::default().fg(theme().white)),
+            Span::styled(
+                "  ───────────────────────────────────────────────────────────",
+                Style::default().fg(theme().dim),
+            ),
+        ]),
+        help_pair(
+            &binding(Action::MoveDown),
+            "Next signal",
+            &binding(Action::MoveUp),
+            "Previous signal",
+        ),
+        help_pair(
+            &format!(
+                "{} / {}",
+                binding(Action::PageDown),
+                binding(Action::PageUp)
+            ),
+            "Jump five",
+            &format!("{} / {}", binding(Action::Top), binding(Action::Bottom)),
+            "Top / bottom",
+        ),
+        help_pair(
+            &binding(Action::Open),
+            "Open selection",
+            &binding(Action::Back),
+            "Back / leave",
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("ROUTES / DISCOVERY", Style::default().fg(theme().white)),
+            Span::styled(
+                "  ────────────────────────────────────────────────────────",
+                Style::default().fg(theme().dim),
+            ),
+        ]),
+        help_pair(
+            &binding(Action::Sidebar),
+            "Focus route rail",
+            &binding(Action::Search),
+            "Search X",
+        ),
+        help_pair(
+            "1 — 5",
+            "Direct route",
+            &binding(Action::Refresh),
+            "Refresh",
+        ),
+        help_pair(
+            &binding(Action::ToggleFeed),
+            "Following / For You",
+            &binding(Action::ExpandThread),
+            "Expand replies",
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("CONTEXT / HANDOFF", Style::default().fg(theme().white)),
+            Span::styled(
+                "  ─────────────────────────────────────────────────────────",
+                Style::default().fg(theme().dim),
+            ),
+        ]),
+        help_pair(
+            &binding(Action::Profile),
+            "Author profile",
+            &binding(Action::Likes),
+            "Liked posts",
+        ),
+        help_pair(
+            &binding(Action::MediaPreview),
+            "Media preview",
+            &binding(Action::OpenMedia),
+            "Open media",
+        ),
+        help_pair(
+            &binding(Action::OpenPost),
+            "Open on x.com",
+            &binding(Action::Quit),
+            "Quit XTUI",
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("MOUSE", Style::default().fg(theme().dim)),
+            Span::styled(
+                "  Wheel moves · hover reveals targets · click opens",
+                Style::default().fg(theme().gray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("FOCUS MODEL", Style::default().fg(theme().dim)),
+            Span::styled(
+                "  The selected post stays pinned; the next posts preview below.",
+                Style::default().fg(theme().gray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            keycap("Q / Esc / ?", true),
+            Span::styled("  CLOSE COMMAND INDEX", Style::default().fg(theme().gray)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_media(frame: &mut Frame, area: Rect, alt: &str, lines: &[String]) {
-    // Size the popup from the artwork's display width (not char count, which
-    // miscounts wide glyphs) and cap it to the terminal so tiny windows never
-    // produce an overflowing popup.
-    let art_width = lines.iter().map(|line| line.width()).max().unwrap_or(20);
+fn help_pair(
+    left_key: &str,
+    left_label: &'static str,
+    right_key: &str,
+    right_label: &'static str,
+) -> Line<'static> {
+    let left_key = truncate_to_width(left_key, 10);
+    let right_key = truncate_to_width(right_key, 10);
+    Line::from(vec![
+        Span::styled(
+            format!(" {left_key:<10} "),
+            Style::default().fg(theme().white).bg(theme().background),
+        ),
+        Span::styled(
+            format!(" {left_label:<22}"),
+            Style::default().fg(theme().gray),
+        ),
+        Span::styled(
+            format!(" {right_key:<10} "),
+            Style::default().fg(theme().white).bg(theme().background),
+        ),
+        Span::styled(format!(" {right_label}"), Style::default().fg(theme().gray)),
+    ])
+}
+
+fn render_media(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some((alt, image)) = app.media_preview.clone() else {
+        return;
+    };
+    let url = app.selected_preview_url().unwrap_or_else(|| alt.clone());
+    let font = app
+        .image_engine
+        .as_ref()
+        .map(|engine| engine.font_size())
+        .unwrap_or_else(crate::media::default_font);
+    let max_cols = area.width.saturating_sub(8).min(crate::media::MODAL_MAX_COLS);
+    let max_rows = area
+        .height
+        .saturating_sub(10)
+        .min(crate::media::MODAL_MAX_ROWS);
+    let (cols, rows) = crate::media::fit_cells(&image, font, max_cols, max_rows);
     let popup = centered(
         area,
-        (art_width as u16 + 6).min(area.width.saturating_sub(2)),
-        (lines.len() as u16 + 7).min(area.height.saturating_sub(2)),
+        (cols.saturating_add(6)).min(area.width.saturating_sub(2)).max(28),
+        (rows.saturating_add(7)).min(area.height.saturating_sub(2)).max(10),
+    );
+    let shadow = Rect {
+        x: popup.x.saturating_add(1).min(area.right()),
+        y: popup.y.saturating_add(1).min(area.bottom()),
+        width: popup
+            .width
+            .min(area.right().saturating_sub(popup.x.saturating_add(1))),
+        height: popup
+            .height
+            .min(area.bottom().saturating_sub(popup.y.saturating_add(1))),
+    };
+    frame.render_widget(Clear, shadow);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(gray(20))),
+        shadow,
     );
     frame.render_widget(Clear, popup);
-    let content_width = popup.width.saturating_sub(4) as usize;
-    let mut text = lines
-        .iter()
-        .map(|line| {
-            Line::from(Span::styled(
-                truncate_to_width(line, content_width),
-                Style::default().fg(Color::White),
-            ))
-        })
-        .collect::<Vec<_>>();
-    text.push(Line::from(""));
-    text.push(Line::from(Span::styled(
-        truncate_to_width(alt, content_width),
-        Style::default().fg(theme().gray),
-    )));
-    text.push(Line::from(Span::styled(
-        "V open in browser · O open post · Esc close",
-        Style::default().fg(theme().dim),
-    )));
-    frame.render_widget(
-        Paragraph::new(text).alignment(Alignment::Center).block(
-            Block::default()
-                .title("  ▍ MEDIA  · Esc to close  ")
-                .title_style(
-                    Style::default()
-                        .fg(theme().accent)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme().dim))
-                .padding(Padding::uniform(1)),
-        ),
-        popup,
-    );
+    let block = Block::default()
+        .title("  Media preview  ")
+        .title_style(
+            Style::default()
+                .fg(theme().white)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme().gray))
+        .padding(Padding::uniform(1))
+        .style(Style::default().bg(theme().surface_raised));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let image_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: cols.min(inner.width).max(1),
+        height: rows.min(inner.height.saturating_sub(3)).max(1),
+    };
+    if let Some(engine) = app.image_engine.as_mut() {
+        engine.render(frame, image_area, &url, &image);
+    }
+    let hints = inner.y.saturating_add(image_area.height.saturating_add(1));
+    if hints < inner.bottom() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    truncate_to_width(&alt, inner.width as usize),
+                    Style::default().fg(theme().gray),
+                )),
+                Line::from(vec![
+                    keycap("V", true),
+                    Span::styled(" OPEN MEDIA   ", Style::default().fg(theme().dim)),
+                    keycap("O", false),
+                    Span::styled(" X.COM   ", Style::default().fg(theme().dim)),
+                    keycap("Esc", false),
+                    Span::styled(" CLOSE", Style::default().fg(theme().dim)),
+                ]),
+            ]),
+            Rect {
+                x: inner.x,
+                y: hints,
+                width: inner.width,
+                height: inner.bottom().saturating_sub(hints).min(2),
+            },
+        );
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -1606,18 +2231,14 @@ mod tests {
                 "missing post content at {width} columns"
             );
             assert!(all.contains("1 / 6"), "missing position at {width} columns");
-            if width >= 104 {
-                assert!(all.contains("CURRENT"), "missing context rail at {width}");
-            } else {
-                assert!(!all.contains("CURRENT"), "rail hidden at {width}");
-            }
+            assert!(
+                !all.contains("CURRENT SIGNAL"),
+                "context rail must stay hidden"
+            );
             assert!(
                 !all.contains("KEYBOARD"),
                 "keyboard dock must be gone at {width} columns"
             );
-            if width < 78 {
-                assert!(all.contains("? keys"), "missing compact hints at {width}");
-            }
         }
     }
 
@@ -1639,9 +2260,23 @@ mod tests {
             "selected card was not pinned: row {focused_row}"
         );
         assert!(next_row > focused_row);
-        assert!(
-            rows.iter().any(|row| row.contains('━')),
-            "focused card keeps its accent frame"
+        assert!(!rows.join("\n").contains("FOCUSED"));
+    }
+
+    #[tokio::test]
+    async fn held_arrow_keys_keep_moving() {
+        let mut app = booted_app().await;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(app.selected, 1);
+        let mut repeat = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        repeat.kind = KeyEventKind::Repeat;
+        handle_key(&mut app, repeat);
+        assert_eq!(
+            app.selected, 2,
+            "key repeat must keep scrolling the feed"
         );
     }
 
@@ -1788,11 +2423,7 @@ mod tests {
             .expect("quit option has a hit target");
         assert!(app.hover_at(quit.x + 1, quit.y));
         assert_eq!(app.hovered, Some(HitAction::Landing(2)));
-        let hovered = rendered(&mut app, 110, 44).join("\n");
-        assert!(
-            hovered.contains("click"),
-            "hover exposes a pointer affordance"
-        );
+        rendered(&mut app, 110, 44);
         handle_click(&mut app, quit.y, quit.x + 1);
         assert!(app.should_quit, "click activates the hovered option");
     }
@@ -1838,39 +2469,48 @@ mod tests {
         let rows = rendered(&mut app, 110, 44);
         let all = rows.join("\n");
         assert!(
-            all.contains("████") && all.lines().any(|line| line.matches('█').count() >= 20),
-            "the large XTUI wordmark is present"
+            all.contains("████") && all.lines().any(|line| line.matches('█').count() >= 14),
+            "the XTUI wordmark is present"
         );
         assert!(
             all.contains('░') && all.contains('▒'),
             "the wordmark keeps its layered extrusion"
         );
-        assert!(all.contains("terminal interface"), "the title is present");
         assert!(
-            all.contains("A focused, keyboard-first timeline."),
-            "the sentence-case product line is present"
+            all.contains("Browse X in your Terminal."),
+            "the product line is present"
         );
         assert!(
-            all.contains("Offline / demo"),
-            "the status deck shows the current mode"
+            all.contains(&format!("xtui version {}", env!("CARGO_PKG_VERSION"))),
+            "the version line is present"
         );
+        assert!(all.contains("Start"), "the start option is present");
         assert!(
-            all.contains("Local / no account"),
-            "account status is shown"
-        );
-        assert!(
-            all.contains("Start reading") && all.contains("Demo / no account"),
-            "the start option is present"
+            !all.contains("Start reading"),
+            "the start label is the short form"
         );
         assert!(
             all.contains("Connect browser extension"),
             "the extension option is present when disconnected"
         );
         assert!(
-            all.contains(env!("CARGO_PKG_VERSION")),
-            "the version footer is present"
+            !all.contains("System /"),
+            "system chrome is gone"
         );
-        assert!(all.contains("Entry points"), "the command deck is labeled");
+        assert!(
+            !all.contains("Identity /"),
+            "identity chrome is gone"
+        );
+        assert!(!all.contains("Entry points"), "the command deck is gone");
+        assert!(all.contains("↑↓"), "navigation hints use arrows");
+        assert!(all.contains('→'), "right is listed as its own action");
+        assert!(all.contains('←'), "left is listed as its own action");
+        assert!(!all.contains("j/k"), "j/k is no longer advertised");
+        assert!(!all.contains("ENTER"), "selected rows no longer show Enter");
+        assert!(
+            all.contains('╭') && all.contains('╰'),
+            "the landing page is cropped by a rounded frame"
+        );
     }
 
     #[tokio::test]
@@ -1878,22 +2518,16 @@ mod tests {
         let mut app = demo_app();
         let compact = rendered(&mut app, 60, 24).join("\n");
         assert!(
-            compact.contains("xtui / terminal interface"),
+            compact.contains("Browse X in your Terminal."),
             "compact viewport keeps the identity"
         );
-        assert!(
-            compact.contains("03  Quit"),
-            "compact menu remains complete"
-        );
+        assert!(compact.contains("Quit"), "compact menu remains complete");
 
         let tiny = rendered(&mut app, 44, 18).join("\n");
         assert!(!tiny.contains("██╗"), "tiny view hides art before controls");
-        assert!(tiny.contains("x t u i"), "tiny view keeps the identity");
-        assert!(tiny.contains("03  Quit"), "tiny menu remains complete");
-        assert!(
-            tiny.contains("enter select"),
-            "tiny controls remain discoverable"
-        );
+        assert!(tiny.contains("xtui"), "tiny view keeps the identity");
+        assert!(tiny.contains("Quit"), "tiny menu remains complete");
+        assert!(tiny.contains('→'), "tiny controls remain discoverable");
     }
 
     #[tokio::test]
@@ -1963,6 +2597,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_omits_decorative_chrome_and_keeps_post_content() {
+        let mut app = booted_app().await;
+        let all = rendered(&mut app, 150, 42).join("\n");
+        assert!(all.contains("Home"));
+        assert!(all.contains("Ada"));
+        assert!(
+            all.contains("██╗  ██╗") && all.contains("tui"),
+            "the sidebar uses the landing X plus plain tui"
+        );
+        assert!(all.contains('┃'), "the selected post has a left rail");
+        assert!(!all.contains("SIGNAL"));
+        assert!(!all.contains("FOCUSED"));
+        assert!(!all.contains("SESSION"));
+    }
+
+    #[tokio::test]
+    async fn pending_reader_uses_an_animated_loading_screen() {
+        let mut app = demo_app();
+        app.screen = Screen::Home;
+        app.request_bootstrap();
+        let all = rendered(&mut app, 100, 32).join("\n");
+        assert!(all.contains("Loading posts"));
+        assert!(all.contains("loading home"));
+        assert!(
+            all.contains('█') || all.contains('▓') || all.contains('▒'),
+            "the loader paints a moving bar"
+        );
+        assert!(!all.contains("BUFFERING"));
+        app.drain().await;
+    }
+
+    #[tokio::test]
+    async fn command_index_reflects_the_runtime_keymap() {
+        let mut app = booted_app().await;
+        app.help = true;
+        let all = rendered(&mut app, 150, 42).join("\n");
+        assert!(all.contains("Keyboard shortcuts"));
+        assert!(all.contains("READ / NAVIGATE"));
+        assert!(all.contains("CONTEXT / HANDOFF"));
+        assert!(all.contains("j / ↓"), "configured bindings are rendered");
+    }
+
+    #[tokio::test]
     async fn status_bar_hints_follow_the_input_mode() {
         let mut app = booted_app().await;
         let normal = rendered(&mut app, 150, 32).join("\n");
@@ -1997,11 +2674,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cards_paint_focused_post_with_accent_frame() {
+    async fn cards_use_selection_background_without_focus_chrome() {
         let mut app = booted_app().await;
         let rows = rendered(&mut app, 150, 36);
         let all = rows.join("\n");
-        assert!(all.contains('━'), "focused card frame should render");
+        assert!(!all.contains("FOCUSED"));
+        assert!(!all.contains("SIGNAL"));
         assert!(!all.contains("NOW READING"), "the banner is gone");
         assert!(all.contains("Home"));
     }
