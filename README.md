@@ -1,111 +1,144 @@
 # XTUI
 
-**X, without leaving your terminal.** XTUI is a read-focused, keyboard-first X client with a responsive black-and-white terminal interface. It can read x.com through an isolated browser companion without paid API credits.
+**X, without leaving your terminal.** XTUI is a read-focused, keyboard-first X client with a
+responsive, strictly black-and-white interface. Its browser extension uses the X session already
+signed in to Edge or Chrome, so XTUI never copies cookies or asks for a second browser login.
 
-![Rust](https://img.shields.io/badge/Rust-1.85%2B-black) ![License](https://img.shields.io/badge/license-MIT-white)
+## Highlights
 
-## What works
+- Following and For You timelines, search, mentions, bookmarks, profiles, likes, Lists, and threads
+- Continuous background pagination with a 144-post reservoir, deduplication, and a bounded
+  800-post memory window
+- Route-isolated, inactive muted X transport tabs keep timeline harvesting alive while a thread,
+  profile, or search is open
+- Responsive wide, medium, compact, and tiny terminal layouts
+- Keyboard, mouse wheel, click selection, bracketed paste, configurable keys, and grayscale themes
+- Non-blocking fetches and event-driven redraws; idle XTUI sleeps instead of polling
+- Deterministic offline demo and optional official X OAuth/API mode
 
-- Reverse-chronological Home / Following timeline
-- Root-post feed with thread drill-down and retractable replies
-- Pinned reading position: the selected post stays at the top with compact next-post previews
-- Recent search, mentions, bookmarks, profiles, user posts, likes, and Lists
-- Reposts, quoted posts, metrics, verification badges, and responsive cards
-- OAuth 2.0 Authorization Code + PKCE login with automatic token refresh
-- Photo previews rendered as monochrome Unicode in any modern terminal
-- Highest-bitrate MP4 handoff for video/GIF media, plus browser permalink handoff
-- Wide three-column, medium two-column, and compact single-column layouts
-- Mouse-wheel scrolling, resize support, errors, empty states, and contextual help
-- A deterministic demo account for exploring every screen without credentials
-
-## Quick start
+## Build and install
 
 ```powershell
 cargo build --release
-.\target\release\xtui.exe browser-login
-# Sign in to X in the browser window, then:
-.\target\release\xtui.exe browser
-```
-
-XTUI remembers browser mode after setup, so subsequent launches need only `xtui.exe`.
-
-For a completely offline tour, use `xtui.exe demo`.
-
-### Install the local `xtui` command (Windows)
-
-After building the release binary, link this repository as a local npm package:
-
-```powershell
-cargo build --release
-Copy-Item .\target\release\xtui.exe .\xtui.exe
+Copy-Item .\target\release\xtui.exe .\xtui.exe -Force
 npm link
-xtui --help
+xtui --version
 ```
 
-`npm link` does not publish anything. It creates a user-level command shim (normally `%APPDATA%\npm\xtui.cmd`), so new terminals can run `xtui`, `xtui demo`, or `xtui browser` directly. Re-run `npm link` after moving the repository or rebuilding from a different checkout.
+`npm link` creates the user-level `xtui` command without publishing anything. Tagged GitHub installs
+also work through `npx --yes github:panther114/xtui`; the launcher downloads the release binary to a
+stable per-user cache.
 
-Inside XTUI, the complete shortcut dock stays visible at the bottom-right on wide layouts. The essentials are `↑`/`↓` to move, `→` to open, `←` to go back, `Tab` to drive the left sidebar (then `↑`/`↓` to choose a section and `→` to open it), `/` to search, `1`–`5` for sections, `M` for a media preview, and `Q` to quit. Search input supports `←`/`→` cursor editing, `Home`/`End` jumps, and `Ctrl+U` to clear.
+## Install the Edge extension
 
-## Free browser-companion mode
+```powershell
+xtui extension install --edge
+xtui extension path
+```
 
-Browser mode launches Microsoft Edge or Google Chrome with an isolated profile at `%APPDATA%\xtui\browser-profile` and a loopback-only debugging port. Sign into X in the visible login window once. Normal XTUI sessions then restart that profile headlessly and read the same rendered post cards you see on x.com—no browser window needs to remain open.
+Then complete Edge's one required consent step:
 
-- XTUI never copies or exports cookies.
-- The bridge offers navigation and rendered-page extraction only.
-- Requests are initiated only by navigation, refresh, or explicit next-page actions.
-- Closing the headless companion process is safe; XTUI reopens the same isolated profile.
-- The renderer suppresses image decoding and autoplay while retaining media URLs for on-demand previews.
-- X can change its page structure at any time, so this mode is less stable than an official API.
-- Automated access may be restricted by X's terms or anti-scraping rules. Use it only for your own account and at your own risk.
+1. Open `edge://extensions`.
+2. Enable **Developer mode**.
+3. Select **Load unpacked**.
+4. Select the folder printed by `xtui extension path`.
+
+XTUI uses the deterministic development extension ID `iepklfmnjidigljfaegfjlbeghpjejka`. Sign in to
+X normally in Edge if you are not already signed in, then verify:
+
+```powershell
+xtui extension status --edge
+xtui extension check --edge
+xtui
+```
+
+For Chrome, replace `--edge` with `--chrome` and load the same folder from
+`chrome://extensions`. Published store builds use the same source package, but store submission is
+separate from this repository build.
+
+## How the bridge works
+
+```text
+XTUI TUI <-> loopback framed channel <-> native messaging host
+                                            ^
+                                            |
+                              MV3 service worker <-> inactive x.com route tabs
+```
+
+- The extension is limited to `https://x.com/*`, `nativeMessaging`, alarms, and tab management.
+- It has no cookie permission, telemetry, X write actions, or arbitrary browser automation.
+- Transport tabs are never focused and never replace user tabs. Videos are paused and animations
+  disabled in those tabs. Old routes are bounded and evicted.
+- Clean XTUI exit closes the tabs immediately. A lost connection closes them through a 30-second
+  watchdog.
+- X can change its rendered page structure; `xtui extension check` distinguishes connection,
+  sign-in, rendering, and pagination failures.
+
+## Keys
+
+| Keys | Action |
+|---|---|
+| `j` / `↓` | Move down and prefetch near the end |
+| `k` / `↑` | Move up |
+| `g` / `G` | Top / bottom |
+| `Enter` / `→` | Open post or list |
+| `Esc` / `←` | Back |
+| `Tab` | Focus navigation rail |
+| `/` | Search |
+| `1`–`5` | Home, Explore, Mentions, Bookmarks, Lists |
+| `f` | Following / For You |
+| `M` / `V` / `O` | Preview media / open media / open post |
+| `?` | Contextual help |
+| `Q` | Quit |
+
+## Configuration
+
+XTUI reads `%APPDATA%\xtui\config.json` on Windows and `~/.config/xtui/config.json` on Linux.
+Legacy `"source": "browser"` values are treated as `"extension"` during migration.
+
+```json
+{
+  "source": "extension",
+  "auto_refresh_secs": 300,
+  "theme": {
+    "accent": "#FFFFFF",
+    "gray": "#9C9C9C",
+    "background": "#000000"
+  },
+  "keys": {
+    "move_down": ["j", "down"],
+    "move_up": ["k", "up"],
+    "search": "/",
+    "quit": "q"
+  }
+}
+```
+
+Every configured color is converted to grayscale. Set `auto_refresh_secs` to `0` to disable silent
+Home refresh.
 
 ## Optional official API mode
 
-The supported official API remains available when prepaid X API credits are acceptable.
+Run `xtui login YOUR_CLIENT_ID` for OAuth 2.0 PKCE after configuring the native-app callback
+`http://127.0.0.1:17171/callback` in the X Developer Console. This route can require paid API
+credits. `XTUI_CLIENT_ID` and `XTUI_ACCESS_TOKEN` remain supported.
 
-1. Create a project/app in the [X Developer Console](https://developer.x.com/en/portal/dashboard).
-2. Enable OAuth 2.0 and select **Native App / public client**.
-3. Register this callback exactly: `http://127.0.0.1:17171/callback`.
-4. Fund the app's API credits as required by X.
-5. Run `cargo run --release -- login YOUR_CLIENT_ID`.
-6. Run `cargo run --release`.
-
-You can alternatively provide `XTUI_CLIENT_ID` and `XTUI_ACCESS_TOKEN`. Saved credentials live in the OS config directory (`%APPDATA%\xtui\config.json` on Windows, `~/.config/xtui/config.json` on Linux). Treat that file as a secret. Use the environment variable route when plaintext local token storage is inappropriate.
-
-Requested OAuth scopes are read-only: `tweet.read`, `users.read`, `follows.read`, `bookmark.read`, `like.read`, `list.read`, and `offline.access`. XTUI does not request write or DM access.
-
-## X API realities
-
-The official API provides a reverse-chronological Following timeline, not X's algorithmic **For You** feed. It also lacks a consolidated pull-style Notifications endpoint, so XTUI calls that screen **Mentions**. Recent-search-backed threads can omit replies older than the API's search window.
-
-X currently bills API reads per resource. XTUI uses pages of 50 only on explicit navigation and does not speculatively prefetch, but a live feed can still consume paid credits. Demo mode never contacts X.
-
-## Layout
-
-```text
-┌───────────────┬────────────────────────────────────────┬──────────────────────┐
-│       𝕏       │ Home                                   │ Search               │
-│  1  Home      │                 Following              │ What's happening     │
-│  2  Explore   ├────────────────────────────────────────┤                      │
-│  3  Mentions  │ Ada  @ada_codes · 4m                   │ Selected             │
-│  4  Bookmarks │ I replaced my browser scroll with…     │ @ada_codes           │
-│  5  Lists     │ ◯ 38    ↻ 226    ♡ 2.4K               │ 38 replies           │
-│               ├────────────────────────────────────────┤                      │
-└───────────────┴────────────────────────────────────────┴──────────────────────┘
-```
-
-At widths below 120 columns the context rail disappears; below 86 columns navigation becomes a bottom tab bar.
-
-## Development
+## Development and validation
 
 ```powershell
+node --test .\extension\tests\manifest.test.js
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo test --lib
 cargo test
-cargo build --release
+cargo build --release --locked
 ```
 
-The `Api` trait isolates X transport from application and UI state. `DemoApi` is the reproducible acceptance backend; `XApi` normalizes X's expansion-heavy responses into the same domain model.
+The official Grok Build source is cloned only as a local landing-page reference under
+`.grok-build-reference/` and is ignored by Git. XTUI's implementation remains native Ratatui code.
 
 ## Scope
 
-XTUI is intentionally read-focused. Posting, replying, liking, reposting, following, and direct messages are not implemented. Rich X cards, live Spaces, algorithmic ranking, and native terminal video playback are outside the official API/portable-terminal envelope; the original post or media opens with one key.
+XTUI is read-only. Posting, replying, liking, reposting, following, and direct messages are not
+implemented. Normal production media/permalink handoff remains available; automated tests replace
+the OS opener with a recorder so validation cannot launch a browser or file.

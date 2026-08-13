@@ -1,6 +1,6 @@
 [package]
 name = "xtui"
-version = "0.1.0"
+version = "0.2.6"
 edition = "2024"
 description = "A focused, keyboard-first terminal client for browsing X"
 license = "MIT"
@@ -12,7 +12,6 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.29"
 dirs = "6.0"
-futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 open = "5.3"
 rand = "0.9"
@@ -24,9 +23,11 @@ sha2 = "0.10"
 textwrap = "0.16"
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
-tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 unicode-width = "0.2"
 url = "2.5"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 [dev-dependencies]
 tempfile = "3.23"

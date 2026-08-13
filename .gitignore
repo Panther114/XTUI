@@ -5,3 +5,6 @@
 /xtui.exe
 *.log
 .env
+/.grok-build-reference/
+/.skills-sh-reference/
+/artifacts/

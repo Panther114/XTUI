@@ -11,6 +11,9 @@ use std::time::Duration;
 pub trait Api: Send + Sync {
     async fn me(&self) -> Result<User>;
     async fn home(&self, next: Option<&str>) -> Result<Page<Post>>;
+    /// Select which Home timeline to serve. Only the browser extension can
+    /// honor this; the official API and demo fall back to Following.
+    async fn set_feed(&self, _feed: FeedKind) {}
     async fn search(&self, query: &str, next: Option<&str>) -> Result<Page<Post>>;
     async fn thread(&self, conversation_id: &str) -> Result<Vec<Post>>;
     async fn bookmarks(&self, next: Option<&str>) -> Result<Page<Post>>;

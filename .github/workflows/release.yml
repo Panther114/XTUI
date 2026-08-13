@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: xtui-linux-x86_64
+          - os: macos-latest
+            artifact: xtui-macos-aarch64
+          - os: windows-latest
+            artifact: xtui-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - name: Stage the binary
+        shell: bash
+        run: |
+          cp target/release/xtui "${{ matrix.artifact }}" || cp target/release/xtui.exe "${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          retention-days: 14
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test extension/tests/manifest.test.js
+      - name: Package Chrome and Edge extension
+        run: |
+          cd extension
+          zip -r ../xtui-extension-chrome.zip manifest.json background.js content.js popup.html popup.css popup.js PRIVACY.md STORE_LISTING.md
+          cp ../xtui-extension-chrome.zip ../xtui-extension-edge.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xtui-browser-extensions
+          path: xtui-extension-*.zip
+          retention-days: 14
+
+  release:
+    needs: [build, extension]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true

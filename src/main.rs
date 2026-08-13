@@ -1,202 +1,158 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::sync::Arc;
 use xtui::{
-    api::{Api, XApi},
+    api::XApi,
     app::App,
     auth,
     config::Config,
     demo::DemoApi,
-    scrape::ScrapeApi,
+    extension::{self, BrowserTarget, ExtensionApi},
+    ui::{Theme, init_theme},
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let native_origin = format!("chrome-extension://{}/", extension::EXTENSION_ID);
+    if std::env::args().nth(1).as_deref() == Some(native_origin.as_str()) {
+        return extension::run_native_host();
+    }
     let mut args = std::env::args().skip(1);
     let command = args.next();
 
+    if command.as_deref() == Some("native-host") {
+        return extension::run_native_host();
+    }
     if matches!(command.as_deref(), Some("--help" | "-h" | "help")) {
         print_help();
         return Ok(());
     }
-
+    if matches!(command.as_deref(), Some("--version" | "-V" | "version")) {
+        println!("xtui {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if command.as_deref() == Some("login") {
         let client_id = args.next().or_else(|| std::env::var("XTUI_CLIENT_ID").ok());
         auth::login(client_id.as_deref()).await?;
         return Ok(());
     }
-
     if command.as_deref() == Some("logout") {
         auth::logout()?;
-        println!("XTUI credentials removed.");
+        println!("XTUI API credentials removed.");
         return Ok(());
     }
-
-    if command.as_deref() == Some("browser-login") {
-        ScrapeApi::open_login().await?;
-        let mut config = Config::load()?;
-        config.source = Some("browser".into());
-        config.save()?;
-        println!(
-            "XTUI opened its isolated browser profile. Sign in to X there, then run `xtui browser`."
-        );
-        return Ok(());
+    if command.as_deref() == Some("extension") {
+        return extension_command(args.next().as_deref(), args.next().as_deref()).await;
     }
-    if command.as_deref() == Some("browser-check") {
-        let api = ScrapeApi::connect().await?;
-        let me = api.me().await?;
-        let home = api.home(None).await?;
-        let more = api.home(home.next_token.as_deref()).await?;
-        let first_ids: std::collections::HashSet<_> = home.items.iter().map(|p| &p.id).collect();
-        let new_posts = more
-            .items
-            .iter()
-            .filter(|p| !first_ids.contains(&p.id))
-            .count();
-        let more_again = api.home(more.next_token.as_deref()).await?;
-        let loaded_ids: std::collections::HashSet<_> = home
-            .items
-            .iter()
-            .chain(more.items.iter())
-            .map(|post| &post.id)
-            .collect();
-        let newer_posts = more_again
-            .items
-            .iter()
-            .filter(|post| !loaded_ids.contains(&post.id))
-            .count();
-        println!(
-            "Browser session: @{} ({})\nVisible Following posts: {}\nNew posts after scroll: {}\nNew posts after second scroll: {}",
-            me.username,
-            me.name,
-            home.items.len(),
-            new_posts,
-            newer_posts
-        );
-        if let Some(check) = args.next() {
-            if check == "--all" {
-                let sweep_started = std::time::Instant::now();
-                let thread_target = home
-                    .items
-                    .iter()
-                    .chain(more.items.iter())
-                    .chain(more_again.items.iter())
-                    .max_by_key(|post| post.metrics.reply_count)
-                    .map(|post| {
-                        (
-                            post.id.clone(),
-                            post.author.username.clone(),
-                            post.metrics.reply_count,
-                        )
-                    });
-                let search = api.search("rust", None).await.map(|page| page.items.len());
-                eprintln!(
-                    "checked search ({:.1}s)",
-                    sweep_started.elapsed().as_secs_f32()
-                );
-                let bookmarks = api.bookmarks(None).await.map(|page| page.items.len());
-                eprintln!(
-                    "checked bookmarks ({:.1}s)",
-                    sweep_started.elapsed().as_secs_f32()
-                );
-                let mentions = api.mentions(None).await.map(|page| page.items.len());
-                eprintln!(
-                    "checked mentions ({:.1}s)",
-                    sweep_started.elapsed().as_secs_f32()
-                );
-                let profile = api.user_by_username(&me.username).await;
-                eprintln!(
-                    "checked profile ({:.1}s)",
-                    sweep_started.elapsed().as_secs_f32()
-                );
-                let posts = api
-                    .user_posts(&me.username, None)
-                    .await
-                    .map(|page| page.items.len());
-                eprintln!(
-                    "checked profile posts ({:.1}s)",
-                    sweep_started.elapsed().as_secs_f32()
-                );
-                let likes = api
-                    .likes(&me.username, None)
-                    .await
-                    .map(|page| page.items.len());
-                eprintln!(
-                    "checked likes ({:.1}s)",
-                    sweep_started.elapsed().as_secs_f32()
-                );
-                let lists = api.lists().await.map(|items| items.len());
-                eprintln!(
-                    "checked lists ({:.1}s)",
-                    sweep_started.elapsed().as_secs_f32()
-                );
-                let thread = match thread_target.as_ref() {
-                    Some((id, _, _)) => api.thread(id).await.map(|items| items.len()),
-                    None => Ok(0),
-                };
-                eprintln!(
-                    "checked thread ({:.1}s)",
-                    sweep_started.elapsed().as_secs_f32()
-                );
-                println!(
-                    "Search: {}\nBookmarks: {}\nMentions: {}\nProfile: {}\nProfile posts: {}\nLikes: {}\nLists: {}\nThread target: {}\nThread posts: {}",
-                    smoke(search),
-                    smoke(bookmarks),
-                    smoke(mentions),
-                    profile
-                        .map(|user| format!("ok (@{})", user.username))
-                        .unwrap_or_else(|error| format!("ERROR: {error}")),
-                    smoke(posts),
-                    smoke(likes),
-                    smoke(lists),
-                    thread_target
-                        .map(|(id, user, replies)| format!("@{user}/{id} ({replies} replies)"))
-                        .unwrap_or_else(|| "none".into()),
-                    smoke(thread)
-                );
-            } else {
-                let results = api.search(&check, None).await?;
-                println!("Search `{check}` results: {}", results.items.len());
-            }
-        }
-        return Ok(());
+    if matches!(
+        command.as_deref(),
+        Some("browser" | "browser-login" | "browser-check")
+    ) {
+        bail!("isolated browser mode was removed in XTUI 0.2; run `xtui extension install --edge`");
     }
 
     let config = Config::load()?;
-    let browser_mode = command.as_deref() == Some("browser") || config.use_browser();
+    init_theme(Theme::from_config(&config.theme));
+    let extension_mode = command.as_deref() == Some("live") || config.use_extension();
     let demo =
-        command.as_deref() == Some("demo") || (!browser_mode && config.access_token().is_none());
+        command.as_deref() == Some("demo") || (!extension_mode && config.access_token().is_none());
+
+    if extension_mode {
+        let api = Arc::new(ExtensionApi::connect().await?);
+        let mut app = App::new(api.clone(), false)
+            .with_config(&config)
+            .with_browser_mode();
+        let result = xtui::ui::run(&mut app).await;
+        api.shutdown().await;
+        return result;
+    }
+
     let api: Arc<dyn xtui::api::Api> = if demo {
         Arc::new(DemoApi::new())
-    } else if browser_mode {
-        Arc::new(ScrapeApi::connect().await?)
     } else {
-        Arc::new(XApi::new(config)?)
+        Arc::new(XApi::new(config.clone())?)
     };
-
-    let mut app = App::new(api, demo);
-    if browser_mode {
-        app = app.with_browser_mode();
-    }
+    let mut app = App::new(api, demo).with_config(&config);
     xtui::ui::run(&mut app).await
 }
 
-fn smoke(result: anyhow::Result<usize>) -> String {
-    result
-        .map(|count| format!("ok ({count})"))
-        .unwrap_or_else(|error| format!("ERROR: {error}"))
+async fn extension_command(action: Option<&str>, browser: Option<&str>) -> Result<()> {
+    let target = BrowserTarget::parse(browser)?;
+    match action.unwrap_or("status") {
+        "prepare" | "path" => println!("{}", extension::prepare_extension()?.display()),
+        "install" => {
+            extension::install_extension(target)?;
+        }
+        "status" => println!(
+            "{}",
+            serde_json::to_string_pretty(&extension::installation_status(target)?)?
+        ),
+        "check" => {
+            let started = std::time::Instant::now();
+            let api = ExtensionApi::connect().await?;
+            use xtui::api::Api;
+            let me = api.me().await?;
+            let session_ms = started.elapsed().as_millis();
+            let first_started = std::time::Instant::now();
+            let first = api.home(None).await?;
+            let first_ms = first_started.elapsed().as_millis();
+            let second_started = std::time::Instant::now();
+            let second = api.home(first.next_token.as_deref()).await?;
+            let second_ms = second_started.elapsed().as_millis();
+            let thread_target = first
+                .items
+                .iter()
+                .chain(second.items.iter())
+                .find(|post| post.metrics.reply_count > 0);
+            let thread_result = if let Some(post) = thread_target {
+                let thread_started = std::time::Instant::now();
+                let replies = api.thread(&post.id).await?;
+                Some((
+                    post.id.as_str(),
+                    replies.len(),
+                    thread_started.elapsed().as_millis(),
+                ))
+            } else {
+                None
+            };
+            println!(
+                "Extension session: @{} ({}) in {} ms\nFirst page: {} posts in {} ms\nNext page: {} posts in {} ms",
+                me.username,
+                me.name,
+                session_ms,
+                first.items.len(),
+                first_ms,
+                second.items.len(),
+                second_ms
+            );
+            if let Some((post_id, posts, elapsed_ms)) = thread_result {
+                println!("Thread {post_id}: {posts} posts in {elapsed_ms} ms");
+            } else {
+                println!("Thread probe: skipped (the sampled cards reported no replies)");
+            }
+            api.shutdown().await;
+        }
+        other => bail!(
+            "unknown extension action `{other}`; use install, prepare, path, status, or check"
+        ),
+    }
+    Ok(())
 }
 
 fn print_help() {
     println!(
-        "XTUI — X, without leaving your terminal\n\n\
-         Usage:\n  xtui                 Start with saved login, or demo mode when logged out\n  \
-         xtui demo            Explore the complete interface with sample data\n  \
-         xtui browser-login   Open XTUI's isolated browser profile for X sign-in\n  \
-         xtui browser         Browse your live feed through the browser companion\n  \
-         xtui browser-check   Verify the browser session and timeline extraction\n  \
-         xtui login [CLIENT]  Authorize through X OAuth 2.0 PKCE (paid API)\n  \
-         xtui logout          Remove locally saved credentials\n  \
-         xtui --help          Show this help\n\n\
-         You can also set XTUI_ACCESS_TOKEN and XTUI_CLIENT_ID."
+        "XTUI {} — X, without leaving your terminal\n\n\
+         Usage:\n  xtui                         Start with the saved source, or demo when unconfigured\n  \
+         xtui demo                    Explore the complete interface with sample data\n  \
+         xtui live                    Browse through the installed browser extension\n  \
+         xtui extension install --edge   Prepare and register the Edge extension\n  \
+         xtui extension install --chrome Prepare and register the Chrome extension\n  \
+         xtui extension status --edge    Inspect extension/native-host installation\n  \
+         xtui extension check --edge     Verify the existing X browser session\n  \
+         xtui login [CLIENT]          Authorize through X OAuth 2.0 PKCE (paid API)\n  \
+         xtui logout                  Remove locally saved API credentials\n  \
+         xtui --version               Show the version\n  \
+         xtui --help                  Show this help\n\n\
+         The extension uses your browser's existing X session; it never copies cookies.",
+        env!("CARGO_PKG_VERSION")
     );
 }
