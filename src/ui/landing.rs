@@ -255,13 +255,15 @@ fn render_taglines(frame: &mut Frame, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let mut lines = vec![Line::from(Span::styled(
-        "Browse X in your Terminal.",
-        Style::default()
-            .fg(theme().white)
-            .add_modifier(Modifier::BOLD),
-    ))
-    .alignment(Alignment::Center)];
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Browse X in your Terminal.",
+            Style::default()
+                .fg(theme().white)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .alignment(Alignment::Center),
+    ];
     if area.height > 1 {
         lines.push(
             Line::from(Span::styled(
@@ -298,12 +300,7 @@ fn render_user_id(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_menu(
-    frame: &mut Frame,
-    area: Rect,
-    app: &mut App,
-    items: &[(String, LandingAction)],
-) {
+fn render_menu(frame: &mut Frame, area: Rect, app: &mut App, items: &[(String, LandingAction)]) {
     if items.is_empty() || area.height == 0 {
         return;
     }

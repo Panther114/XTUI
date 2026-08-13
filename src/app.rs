@@ -679,10 +679,7 @@ impl App {
     pub fn landing_items(&self) -> Vec<(String, LandingAction)> {
         let mut items = vec![];
         if self.demo {
-            items.push((
-                "Start (demo — no account)".into(),
-                LandingAction::Start,
-            ));
+            items.push(("Start (demo — no account)".into(), LandingAction::Start));
         } else {
             let mode = if self.browser_mode {
                 "live · browser extension"

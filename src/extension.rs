@@ -558,12 +558,15 @@ async fn connect_stream() -> Result<TcpStream> {
         }
         tokio::time::sleep(Duration::from_millis(150 * (attempt as u64 + 1))).await;
     }
-    Err(last.unwrap_or_else(|| {
-        anyhow!("the XTUI browser extension is not connected; load it and keep the browser running")
-    })
-    .context(
-        "the XTUI browser extension is not connected; load it and keep the browser running",
-    ))
+    Err(last
+        .unwrap_or_else(|| {
+            anyhow!(
+                "the XTUI browser extension is not connected; load it and keep the browser running"
+            )
+        })
+        .context(
+            "the XTUI browser extension is not connected; load it and keep the browser running",
+        ))
 }
 
 fn bridge_error_is_retryable(error: &anyhow::Error) -> bool {

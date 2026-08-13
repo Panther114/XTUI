@@ -552,7 +552,9 @@ fn render_nav_wordmark(frame: &mut Frame, area: Rect) -> u16 {
             // Pad every row to the same width so centering does not jog the X.
             spans.push(Span::styled(
                 if index == 5 { " tui" } else { "    " },
-                Style::default().fg(theme().white).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme().white)
+                    .add_modifier(Modifier::BOLD),
             ));
             Line::from(spans).alignment(Alignment::Center)
         })
@@ -621,9 +623,10 @@ fn render_nav(frame: &mut Frame, area: Rect, app: &mut App, compact: bool) {
             Style::default().fg(theme().gray)
         };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(format!("{marker} {label}"), style),
-            ]))
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("{marker} {label}"),
+                style,
+            )]))
             .alignment(Alignment::Center)
             .style(style),
             Rect {
@@ -2028,7 +2031,10 @@ fn render_media(frame: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .map(|engine| engine.font_size())
         .unwrap_or_else(crate::media::default_font);
-    let max_cols = area.width.saturating_sub(8).min(crate::media::MODAL_MAX_COLS);
+    let max_cols = area
+        .width
+        .saturating_sub(8)
+        .min(crate::media::MODAL_MAX_COLS);
     let max_rows = area
         .height
         .saturating_sub(10)
@@ -2036,8 +2042,12 @@ fn render_media(frame: &mut Frame, area: Rect, app: &mut App) {
     let (cols, rows) = crate::media::fit_cells(&image, font, max_cols, max_rows);
     let popup = centered(
         area,
-        (cols.saturating_add(6)).min(area.width.saturating_sub(2)).max(28),
-        (rows.saturating_add(7)).min(area.height.saturating_sub(2)).max(10),
+        (cols.saturating_add(6))
+            .min(area.width.saturating_sub(2))
+            .max(28),
+        (rows.saturating_add(7))
+            .min(area.height.saturating_sub(2))
+            .max(10),
     );
     let shadow = Rect {
         x: popup.x.saturating_add(1).min(area.right()),
@@ -2266,18 +2276,12 @@ mod tests {
     #[tokio::test]
     async fn held_arrow_keys_keep_moving() {
         let mut app = booted_app().await;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-        );
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.selected, 1);
         let mut repeat = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         repeat.kind = KeyEventKind::Repeat;
         handle_key(&mut app, repeat);
-        assert_eq!(
-            app.selected, 2,
-            "key repeat must keep scrolling the feed"
-        );
+        assert_eq!(app.selected, 2, "key repeat must keep scrolling the feed");
     }
 
     #[tokio::test]
@@ -2493,14 +2497,8 @@ mod tests {
             all.contains("Connect browser extension"),
             "the extension option is present when disconnected"
         );
-        assert!(
-            !all.contains("System /"),
-            "system chrome is gone"
-        );
-        assert!(
-            !all.contains("Identity /"),
-            "identity chrome is gone"
-        );
+        assert!(!all.contains("System /"), "system chrome is gone");
+        assert!(!all.contains("Identity /"), "identity chrome is gone");
         assert!(!all.contains("Entry points"), "the command deck is gone");
         assert!(all.contains("↑↓"), "navigation hints use arrows");
         assert!(all.contains('→'), "right is listed as its own action");

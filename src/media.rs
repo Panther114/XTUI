@@ -7,12 +7,7 @@ use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
 };
-use std::{
-    collections::HashMap,
-    env,
-    io::Cursor,
-    time::Duration,
-};
+use std::{collections::HashMap, env, io::Cursor, time::Duration};
 
 const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -168,12 +163,7 @@ impl ImageEngine {
         self.states.remove(url);
     }
 
-    pub fn slot_size(
-        &self,
-        image: &PreviewImage,
-        max_cols: u16,
-        max_rows: u16,
-    ) -> (u16, u16) {
+    pub fn slot_size(&self, image: &PreviewImage, max_cols: u16, max_rows: u16) -> (u16, u16) {
         fit_cells(image, self.font_size(), max_cols, max_rows)
     }
 
@@ -196,11 +186,7 @@ impl ImageEngine {
         let Some(state) = self.states.get_mut(url) else {
             return;
         };
-        frame.render_stateful_widget(
-            StatefulImage::new().resize(Resize::Fit(None)),
-            area,
-            state,
-        );
+        frame.render_stateful_widget(StatefulImage::new().resize(Resize::Fit(None)), area, state);
     }
 }
 
@@ -222,29 +208,31 @@ pub fn default_font() -> FontSize {
     window_font_size().unwrap_or(FontSize::new(10, 20))
 }
 
-pub fn fit_cells(
-    image: &PreviewImage,
-    font: FontSize,
-    max_cols: u16,
-    max_rows: u16,
-) -> (u16, u16) {
+pub fn fit_cells(image: &PreviewImage, font: FontSize, max_cols: u16, max_rows: u16) -> (u16, u16) {
     let font = font.max_or_default();
     let max_cols = max_cols.max(1);
     let max_rows = max_rows.max(1);
-    let native_cols = (image.width() as f32 / f32::from(font.width)).ceil().max(1.0);
+    let native_cols = (image.width() as f32 / f32::from(font.width))
+        .ceil()
+        .max(1.0);
     let native_rows = (image.height() as f32 / f32::from(font.height))
         .ceil()
         .max(1.0);
     let scale = (f32::from(max_cols) / native_cols)
         .min(f32::from(max_rows) / native_rows)
         .min(1.0);
-    let cols = (native_cols * scale).round().clamp(1.0, f32::from(max_cols)) as u16;
-    let rows = (native_rows * scale).round().clamp(1.0, f32::from(max_rows)) as u16;
+    let cols = (native_cols * scale)
+        .round()
+        .clamp(1.0, f32::from(max_cols)) as u16;
+    let rows = (native_rows * scale)
+        .round()
+        .clamp(1.0, f32::from(max_rows)) as u16;
     (cols, rows)
 }
 
 fn forced_graphics_protocol() -> Option<ProtocolType> {
-    if env::var_os("WT_SESSION").is_some() || env::var("TERM_PROGRAM").ok().as_deref() == Some("vscode")
+    if env::var_os("WT_SESSION").is_some()
+        || env::var("TERM_PROGRAM").ok().as_deref() == Some("vscode")
     {
         return Some(ProtocolType::Sixel);
     }
@@ -256,14 +244,15 @@ fn forced_graphics_protocol() -> Option<ProtocolType> {
         _ => {}
     }
     if env::var_os("KITTY_WINDOW_ID").is_some()
-        || env::var("TERM").ok().is_some_and(|term| term.contains("kitty"))
+        || env::var("TERM")
+            .ok()
+            .is_some_and(|term| term.contains("kitty"))
     {
         return Some(ProtocolType::Kitty);
     }
-    if env::var("TERM")
-        .ok()
-        .is_some_and(|term| term.contains("sixel") || term.contains("mlterm") || term.contains("foot"))
-    {
+    if env::var("TERM").ok().is_some_and(|term| {
+        term.contains("sixel") || term.contains("mlterm") || term.contains("foot")
+    }) {
         return Some(ProtocolType::Sixel);
     }
     #[cfg(windows)]
