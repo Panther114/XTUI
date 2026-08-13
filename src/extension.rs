@@ -386,11 +386,9 @@ fn acquire_bridge_lock() -> Result<BridgeLock> {
         fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
     }
-    let mut file = open_exclusive_lock(&path).with_context(|| {
-        format!(
-            "another XTUI is already using the browser bridge; quit that terminal session first"
-        )
-    })?;
+    let mut file = open_exclusive_lock(&path).with_context(
+        || "another XTUI is already using the browser bridge; quit that terminal session first",
+    )?;
     file.set_len(0)?;
     writeln!(file, "{}", std::process::id())?;
     file.flush()?;
@@ -402,6 +400,7 @@ fn open_exclusive_lock(path: &Path) -> Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     Ok(fs::OpenOptions::new()
         .create(true)
+        .truncate(true)
         .read(true)
         .write(true)
         .share_mode(0)

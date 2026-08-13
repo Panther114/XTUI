@@ -257,7 +257,7 @@ fn forced_graphics_protocol() -> Option<ProtocolType> {
     }
     #[cfg(windows)]
     {
-        return Some(ProtocolType::Sixel);
+        Some(ProtocolType::Sixel)
     }
     #[cfg(not(windows))]
     None

@@ -106,8 +106,7 @@ fn render_wordmark(frame: &mut Frame, area: Rect, scale_x: usize, scale_y: usize
                     };
                     let base = base_luma[row.min(base_luma.len() - 1)];
                     let mut amount = (shine * 0.76 + scan + breathing * 0.05).min(1.0);
-                    if glitch_active && (scaled_row * 17 + unshifted_column * 7).is_multiple_of(19)
-                    {
+                    if glitch_active && (scaled_row * 17 + unshifted_column * 7) % 19 == 0 {
                         character = if character == '█' { '▓' } else { '█' };
                         amount = 1.0;
                     }
